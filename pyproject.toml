@@ -6,9 +6,8 @@ build-backend = "setuptools.build_meta"
 name = "layout-check-mcp"
 version = "1.0.0"
 description = "PCB footprint tolerance check MCP server"
-readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
     {name = "ds2457513911", email = "ds2457513911@163.com"},
 ]
@@ -21,3 +20,8 @@ dependencies = [
 
 [project.scripts]
 layout-check-mcp = "mcp_server.server:main"
+
+# 关键：明确告诉 setuptools 只打包这三个包，排除 Tools
+[tool.setuptools.packages.find]
+include = ["mcp_server*", "services*", "shared*"]
+exclude = ["Tools*", "skills*", ".trae*"]

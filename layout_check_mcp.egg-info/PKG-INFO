@@ -1,0 +1,11 @@
+Metadata-Version: 2.4
+Name: layout-check-mcp
+Version: 1.0.0
+Summary: PCB footprint tolerance check MCP server
+Author-email: ds2457513911 <ds2457513911@163.com>
+License-Expression: MIT
+Requires-Python: >=3.10
+Requires-Dist: fastmcp
+Requires-Dist: skillbridge
+Requires-Dist: PyMuPDF
+Requires-Dist: pdfplumber

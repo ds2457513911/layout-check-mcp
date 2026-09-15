@@ -1,0 +1,2 @@
+[console_scripts]
+layout-check-mcp = mcp_server.server:main
