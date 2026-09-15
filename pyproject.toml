@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "layout-check-mcp"
+version = "1.0.0"
+description = "PCB footprint tolerance check MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "ds2457513911", email = "ds2457513911@163.com"},
+]
+dependencies = [
+    "fastmcp",
+    "skillbridge",
+    "PyMuPDF",
+    "pdfplumber",
+]
+
+[project.scripts]
+layout-check-mcp = "mcp_server.server:main"

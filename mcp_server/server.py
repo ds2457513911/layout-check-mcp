@@ -38,5 +38,9 @@ register_resources(mcp)
 register_prompts(mcp)
 
 
-if __name__ == "__main__":
+def main():
     mcp.run()
+
+
+if __name__ == "__main__":
+    main()
