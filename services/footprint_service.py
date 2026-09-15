@@ -3,9 +3,12 @@
 services/footprint_service.py —— 封装检查业务编排
 
 职责：
-  - 提取理论焊盘参数（调 services.pdf_renderer）
-  - 执行理论 vs 实际的公差比对（调 services.tolerance_service）
-  - 把检查结果写成 JSON 报告，方便后期人工复查
+  - 执行理论 vs 实际的公差比对
+  - 把检查结果写成 JSON 报告
+
+说明：
+  - 已移除 extract_theoretical（moondream 引擎路径）
+  - 理论参数由客户端 AI 从 PDF 图片中读取，通过 MCP resource 传递
 
 这一层不感知 MCP，可被批处理脚本、单元测试、MCP tool 复用。
 """
@@ -16,34 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from services.pdf_renderer import parse_pdf_land_pattern
 from services.tolerance_service import check_dimension_tolerance
-
-
-def extract_theoretical(
-    pdf_path: Path,
-    page: int,
-    out_root: Path,
-    render_engine: str = "pymupdf",
-    source_tag: Optional[dict] = None,
-) -> dict:
-    """
-    用 moondream2 引擎从 PDF 指定页提取理论焊盘参数。
-
-    :param pdf_path: PDF 绝对路径
-    :param page: 人眼 1-based 页码
-    :param out_root: marker / pymupdf 渲染输出根目录
-    :param render_engine: "pymupdf"（默认）或 "marker"
-    :param source_tag: 附加到返回值的溯源信息
-    :return: parse_pdf_land_pattern 的原始返回
-    """
-    return parse_pdf_land_pattern(
-        pdf_file_path=pdf_path,
-        target_page=page,
-        marker_root=out_root,
-        render_engine=render_engine,
-        source_tag=source_tag,
-    )
 
 
 def check_tolerance(
@@ -55,7 +31,7 @@ def check_tolerance(
     公差比对：理论焊盘参数 vs 实际封装参数。
 
     :param theoretical_payload: 包含 theoretical_land_params 的完整 payload
-    :param actual_payload: lib_allegro_reader 返回的 actual_payload
+    :param actual_payload: services.allegro_reader 返回的 actual_payload
     :param tolerance: 公差配置；None 时由 tolerance_service 按维度回落默认
     :return: check_dimension_tolerance 的原始返回
     """
@@ -126,7 +102,6 @@ def save_report(
         "actual_payload": None,
     }
 
-    # 可选溯源信息
     if isinstance(theoretical_payload, dict):
         report["theoretical_land_params"] = theoretical_payload.get(
             "theoretical_land_params"

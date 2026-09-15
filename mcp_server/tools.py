@@ -10,7 +10,9 @@ mcp_server/tools.py —— MCP 工具定义
 
   严禁在 tool 里写业务逻辑（循环、文件扫描、JSON 清洗）。
 
-  通过 register(mcp) 注册到 FastMCP 实例，避免循环导入。
+说明：
+  - 已移除 parse_datasheet_land_pattern（moondream 引擎路径）
+  - 理论参数由客户端 AI 从 PDF 图片中读取
 """
 from __future__ import annotations
 
@@ -94,41 +96,7 @@ def register(mcp: FastMCP) -> None:
         return pdf_service.locate_land_pattern_page(pdf)
 
     # ============================================================
-    # Tool 3: 用 moondream2 提取理论参数（兜底）
-    # ============================================================
-    @mcp.tool()
-    def parse_datasheet_land_pattern(
-        pdf_file_path: str,
-        target_page: int,
-        render_engine: str = "pymupdf",
-    ) -> dict:
-        """
-        用本地 moondream2 模型解析 PDF 指定页，提取理论焊盘参数。
-
-        这是"确定性引擎"路径：渲染 → moondream2 → 结构化 JSON。
-        如果你（AI）想自己读图提取，改用 resource + prompt，不要调这个 tool。
-
-        :param pdf_file_path: PDF 路径（完整路径或 stem 均可）
-        :param target_page: 人眼 1-based 页码
-        :param render_engine: "pymupdf"（默认，整页渲染）或 "marker"（版面分析）
-        :return: 符合 check_land_pattern_tolerance 输入格式的 theoretical_payload
-        """
-        pdf = pdf_service.resolve_pdf(pdf_file_path, config.PDF_SEARCH_ROOTS)
-        if pdf is None:
-            return {
-                "error": f"找不到 PDF: {pdf_file_path}",
-                "theoretical_land_params": None,
-            }
-        return footprint_service.extract_theoretical(
-            pdf_path=pdf,
-            page=target_page,
-            out_root=config.MARKER_ROOT,
-            render_engine=render_engine,
-            source_tag={"source": "mcp_server"},
-        )
-
-    # ============================================================
-    # Tool 4: 读取 Allegro 实际封装
+    # Tool 3: 读取 Allegro 实际封装
     # ============================================================
     @mcp.tool()
     def read_allegro_footprint(
@@ -148,7 +116,7 @@ def register(mcp: FastMCP) -> None:
         )
 
     # ============================================================
-    # Tool 5: 校验 AI 输出的 JSON
+    # Tool 4: 校验 AI 输出的 JSON
     # ============================================================
     @mcp.tool()
     def validate_land_pattern_json(raw_json: str) -> dict:
@@ -169,7 +137,7 @@ def register(mcp: FastMCP) -> None:
         :return: {
             "valid": bool,
             "errors": [str],
-            "normalized": dict   # 可直接喂给 check_land_pattern_tolerance
+            "normalized": dict
         }
         """
         try:
@@ -185,7 +153,7 @@ def register(mcp: FastMCP) -> None:
         return {"valid": valid, "errors": errors, "normalized": normalized}
 
     # ============================================================
-    # Tool 6: 公差比对
+    # Tool 5: 公差比对
     # ============================================================
     @mcp.tool()
     def check_land_pattern_tolerance(
@@ -196,8 +164,7 @@ def register(mcp: FastMCP) -> None:
         """
         理论焊盘参数 vs Allegro 实际封装参数 公差比对。
 
-        :param theoretical_payload: 来自 parse_datasheet_land_pattern 的完整返回，
-                                    或 {theoretical_land_params: {...}} 结构
+        :param theoretical_payload: 形如 {theoretical_land_params: {...}} 的完整结构
         :param actual_payload: 来自 read_allegro_footprint 的返回
         :param tolerance: 公差配置；不传则用默认
                          （width/height ±0.1，spacing ±0.15）
@@ -210,7 +177,7 @@ def register(mcp: FastMCP) -> None:
         )
 
     # ============================================================
-    # Tool 7: 保存 JSON 报告
+    # Tool 6: 保存 JSON 报告
     # ============================================================
     @mcp.tool()
     def save_tolerance_report(
@@ -225,11 +192,10 @@ def register(mcp: FastMCP) -> None:
 
         默认写到 .dra 所在目录，文件名带时间戳：
         tolerance_report_YYYYMMDD_HHMMSS.json。
-        报告包含：结论、汇总、逐项比对明细、理论值、实际值、溯源信息。
 
         :param comparison_result: check_land_pattern_tolerance 的完整返回
-        :param theoretical_payload: 可选，理论 payload（用于报告里保留原始提取结果）
-        :param actual_payload: 可选，实际 payload（用于报告里保留 Allegro 原始数据）
+        :param theoretical_payload: 可选，理论 payload
+        :param actual_payload: 可选，实际 payload
         :param output_dir: 输出目录；不传时自动用 .dra 所在目录
         :param filename: 文件名；不传时自动带时间戳
         :return: {"ok": bool, "path": str, "error": str}
