@@ -3,3 +3,5 @@ __pycache__/
 marker_out/
 .cleanup_backup/
 skills/
+build/
+layout_check_mcp.egg-info/
