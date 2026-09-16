@@ -10,18 +10,22 @@ mcp_server/tools.py —— MCP 工具定义
 
   严禁在 tool 里写业务逻辑（循环、文件扫描、JSON 清洗）。
 
-说明：
-  - 已移除 parse_datasheet_land_pattern（moondream 引擎路径）
-  - 理论参数由客户端 AI 从 PDF 图片中读取
+新增 tool（v2）：
+  - read_full_footprint        从 .dra 全量提取封装数据
+  - check_footprint_by_rules   跑 Excel 规范的数值规则检查
+  - save_checklist_report      按 6 大项保存 JSON 报告
 """
 from __future__ import annotations
 
+import json
+from datetime import datetime
 from pathlib import Path
 
 from fastmcp import FastMCP
 
 from mcp_server import config
 from services import allegro_service, footprint_service, pdf_service
+from services import footprint_extractor, rule_checker
 from shared.json_utils import coerce_numeric, extract_json_body
 from shared.validation import validate_land_pattern
 
@@ -96,7 +100,7 @@ def register(mcp: FastMCP) -> None:
         return pdf_service.locate_land_pattern_page(pdf)
 
     # ============================================================
-    # Tool 3: 读取 Allegro 实际封装
+    # Tool 3: 读取 Allegro 实际封装（旧版：只读焊盘）
     # ============================================================
     @mcp.tool()
     def read_allegro_footprint(
@@ -104,7 +108,11 @@ def register(mcp: FastMCP) -> None:
         pad_file_paths: list[str] | None = None,
     ) -> dict:
         """
-        通过 SkillBridge 读取 Allegro .dra 封装的实际焊盘参数。
+        通过 SkillBridge 读取 Allegro .dra 封装的实际焊盘参数（简化版）。
+
+        只返回焊盘尺寸 + 间距，用于基本的焊盘比对。
+        如果需要更全面的数据（Silkscreen / Assembly / Place_Bound 等），
+        请改用 read_full_footprint。
 
         :param dra_file_path: .dra 文件完整路径
         :param pad_file_paths: 可选的 .pad 文件路径列表（仅用于溯源记录）
@@ -114,6 +122,94 @@ def register(mcp: FastMCP) -> None:
             dra_path=dra_file_path,
             pad_paths=pad_file_paths,
         )
+
+    # ============================================================
+    # Tool 3b: 全量读取 Allegro 封装（新版）
+    # ============================================================
+    @mcp.tool()
+    def read_full_footprint(
+        dra_file_path: str,
+        pad_file_paths: list[str] | None = None,
+    ) -> dict:
+        """
+        从 .dra 全量提取封装数据（用于 6 大项规则检查）。
+
+        比 read_allegro_footprint 多提取以下内容：
+          - 每个 pin 的所有层 pad（ETCH / SOLDERMASK / PASTEMASK / ...）
+          - Silkscreen_Top / Assembly_Top / Place_Bound_Top 的图形元素
+          - design.text（位号、极性标识等）
+          - 单位、design bbox
+
+        这个 tool 只提取数据，不做规则判断。
+        规则检查请调用 check_footprint_by_rules。
+
+        :param dra_file_path: .dra 文件完整路径
+        :param pad_file_paths: 可选的 .pad 文件路径列表
+        :return: footprint_extractor.read_full_footprint 的完整返回
+        """
+        return footprint_extractor.read_full_footprint(
+            dra_path=dra_file_path,
+            pad_paths=pad_file_paths or [],
+            workspace_id=config.SKILLBRIDGE_WORKSPACE_ID,
+        )
+
+    # ============================================================
+    # Tool 3c: 跑规则检查（提取 + 检查 一步到位）
+    # ============================================================
+    @mcp.tool()
+    def check_footprint_by_rules(
+        dra_file_path: str,
+        theoretical_payload: dict | None = None,
+        pad_file_paths: list[str] | None = None,
+        custom_rules: dict | None = None,
+    ) -> dict:
+        """
+        从 .dra 提取封装数据，并跑完整的数值规则检查。
+
+        覆盖 Excel 规范的 6 大项（数值部分）：
+          - 1. 封装命名规范（前缀、小数点、数字）
+          - 2. 焊盘尺寸（与命名一致性、阻焊/钢网外扩）
+          - 3. 间距与原点（pitch、最小间距、原点居中）
+          - 5. Place_Bound（存在、覆盖、外扩量）
+          - 6. Assembly / Silkscreen（存在、1 脚标识、重叠）
+
+        :param dra_file_path: .dra 文件完整路径
+        :param theoretical_payload: 可选，datasheet 理论参数（用于 pitch 对比）
+        :param pad_file_paths: 可选的 .pad 文件路径列表
+        :param custom_rules: 可选，自定义规则（覆盖默认）
+        :return: {
+            "conclusion": "PASS" | "FAIL" | "REVIEW_REQUIRED",
+            "component_type": "ic" | "chip" | "connector" | "unknown",
+            "summary": {...},
+            "items": [...],
+            "failed": [...],
+            "warned": [...],
+            "footprint_data": {...},   # 原始提取数据，方便排查
+        }
+        """
+        # 1. 提取数据
+        fp_data = footprint_extractor.read_full_footprint(
+            dra_path=dra_file_path,
+            pad_paths=pad_file_paths or [],
+            workspace_id=config.SKILLBRIDGE_WORKSPACE_ID,
+        )
+        if fp_data.get("error"):
+            return {
+                "conclusion": "FAIL",
+                "error": fp_data["error"],
+                "footprint_data": fp_data,
+            }
+
+        # 2. 跑规则检查
+        result = rule_checker.run_numeric_checks(
+            footprint_data=fp_data,
+            theoretical=theoretical_payload,
+            rules=custom_rules,
+        )
+
+        # 3. 附上原始提取数据
+        result["footprint_data"] = fp_data
+        return result
 
     # ============================================================
     # Tool 4: 校验 AI 输出的 JSON
@@ -126,19 +222,8 @@ def register(mcp: FastMCP) -> None:
         建议在 AI 自己读图提取参数之后、调 check_land_pattern_tolerance 之前
         先调这个 tool 做守门员，避免格式漂移导致比对失败。
 
-        校验项：
-          - unit 是否为 mm 或 mil
-          - pads 是否为列表，每个 pad 的 pin/width/height 是否合法
-          - spacing_x / spacing_y 是否为数字或 null
-          - 数值是否在合理范围（0.001 ~ 100 mm）
-          - 剥离 ```json 围栏、全角转半角、字符串数字转 float
-
         :param raw_json: AI 输出的原始 JSON 字符串
-        :return: {
-            "valid": bool,
-            "errors": [str],
-            "normalized": dict
-        }
+        :return: {"valid": bool, "errors": [str], "normalized": dict}
         """
         try:
             parsed = extract_json_body(raw_json)
@@ -153,7 +238,7 @@ def register(mcp: FastMCP) -> None:
         return {"valid": valid, "errors": errors, "normalized": normalized}
 
     # ============================================================
-    # Tool 5: 公差比对
+    # Tool 5: 公差比对（旧版，保留兼容）
     # ============================================================
     @mcp.tool()
     def check_land_pattern_tolerance(
@@ -167,7 +252,6 @@ def register(mcp: FastMCP) -> None:
         :param theoretical_payload: 形如 {theoretical_land_params: {...}} 的完整结构
         :param actual_payload: 来自 read_allegro_footprint 的返回
         :param tolerance: 公差配置；不传则用默认
-                         （width/height ±0.1，spacing ±0.15）
         :return: PASS/FAIL/NA + 逐 pin 明细 + 汇总 + conclusion
         """
         return footprint_service.check_tolerance(
@@ -177,7 +261,7 @@ def register(mcp: FastMCP) -> None:
         )
 
     # ============================================================
-    # Tool 6: 保存 JSON 报告
+    # Tool 6: 保存 JSON 报告（旧版：焊盘公差报告）
     # ============================================================
     @mcp.tool()
     def save_tolerance_report(
@@ -188,10 +272,7 @@ def register(mcp: FastMCP) -> None:
         filename: str | None = None,
     ) -> dict:
         """
-        把一次封装检查的结果写成 JSON 文件，方便后期人工复查。
-
-        默认写到 .dra 所在目录，文件名带时间戳：
-        tolerance_report_YYYYMMDD_HHMMSS.json。
+        把一次焊盘公差检查的结果写成 JSON 文件，方便后期人工复查。
 
         :param comparison_result: check_land_pattern_tolerance 的完整返回
         :param theoretical_payload: 可选，理论 payload
@@ -207,3 +288,83 @@ def register(mcp: FastMCP) -> None:
             output_dir=output_dir,
             filename=filename,
         )
+
+    # ============================================================
+    # Tool 7: 保存 6 大项清单报告（新版）
+    # ============================================================
+    @mcp.tool()
+    def save_checklist_report(
+        checklist_result: dict,
+        dra_file_path: str | None = None,
+        output_dir: str | None = None,
+        filename: str | None = None,
+    ) -> dict:
+        """
+        把一次完整清单检查（6 大项）的结果写成 JSON 文件。
+
+        报告结构：
+          - metadata：时间、.dra 文件、元件类型
+          - conclusion / summary
+          - items：17 项逐项结果
+          - failed / warned：单独抽出失败和警告项
+
+        :param checklist_result: check_footprint_by_rules 的返回
+        :param dra_file_path: .dra 路径；不传时从 checklist_result.footprint_data 推断
+        :param output_dir: 输出目录；不传时用 .dra 所在目录
+        :param filename: 文件名；不传时带时间戳
+        :return: {"ok": bool, "path": str, "error": str}
+        """
+        if not isinstance(checklist_result, dict):
+            return {"ok": False, "path": "", "error": "checklist_result 不是 dict"}
+
+        # 推断输出目录
+        if output_dir is None:
+            if dra_file_path is None:
+                fp_data = checklist_result.get("footprint_data") or {}
+                dra_file_path = fp_data.get("source_file")
+            if dra_file_path:
+                output_dir = Path(dra_file_path).parent
+            else:
+                return {
+                    "ok": False,
+                    "path": "",
+                    "error": "无法推断输出目录，请显式传 output_dir 或 dra_file_path",
+                }
+
+        out_dir = Path(output_dir)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return {"ok": False, "path": str(out_dir), "error": f"创建目录失败: {e}"}
+
+        # 文件名
+        if filename is None:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"checklist_report_{ts}.json"
+
+        out_path = out_dir / filename
+
+        # 组装报告
+        fp_data = checklist_result.get("footprint_data") or {}
+        report = {
+            "report_version": "2.0",
+            "generated_at": datetime.now().isoformat(timespec="seconds"),
+            "dra_file": fp_data.get("source_file"),
+            "symbol_name": fp_data.get("symbol_name"),
+            "component_type": checklist_result.get("component_type"),
+            "conclusion": checklist_result.get("conclusion"),
+            "summary": checklist_result.get("summary"),
+            "items": checklist_result.get("items"),
+            "failed": checklist_result.get("failed"),
+            "warned": checklist_result.get("warned"),
+        }
+
+        try:
+            out_path.write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            return {"ok": False, "path": str(out_path), "error": f"写文件失败: {e}"}
+
+        return {"ok": True, "path": str(out_path.resolve()), "error": ""}

@@ -5,5 +5,6 @@ build/
 marker_out/
 .cleanup_backup/
 .migration_backup/
-.trae/
+# .trae/
 .venv/
+Tools/
