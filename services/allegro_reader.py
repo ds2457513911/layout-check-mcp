@@ -1,10 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-lib_allegro_reader.py —— 通过 Allegro SkillBridge 读取 .dra 封装参数
-输出格式适配 job_compare_all.py / lib_tolerance_check 的 check_dimension_tolerance 工具
+services/allegro_reader.py —— 通过 Allegro SkillBridge 读取 .dra 封装参数
 
-支持：
-  - 中文路径（自动复制到临时英文目录）
+输出格式适配 lib_tolerance_check 的 check_dimension_tolerance 工具。
+
+核心设计：
+  - **总是**把 .dra / .psm / .pad 复制到临时英文目录再打开
+    · 规避中文路径导致 SKILL 解析器报错（\\u 转义）
+    · 规避文件锁冲突：用户手动用 Allegro 打开 .dra 时会在旁边生成 .lck，
+      SkillBridge 直接开原件会卡死（等待 Allegro 弹窗）
   - 单位启发式校验（不盲信 axlDBGetDesignUnits）
   - 一个 .dra 对应多个 .pad（全部作为溯源信息记录）
 """
@@ -80,7 +84,6 @@ def _bbox_to_dims(bbox: Any) -> Optional[Dict[str, float]]:
         return None
 
     try:
-        # 格式 1: [[x1, y1], [x2, y2]]
         if (
             len(bbox) == 2
             and hasattr(bbox[0], "__len__")
@@ -103,7 +106,6 @@ def _bbox_to_dims(bbox: Any) -> Optional[Dict[str, float]]:
                 "y": (bottom + top) / 2,
             }
 
-        # 格式 2: [left, bottom, right, top]
         if len(bbox) >= 4:
             left, bottom, right, top = [float(v) for v in bbox[:4]]
             width = abs(right - left)
@@ -122,7 +124,6 @@ def _bbox_to_dims(bbox: Any) -> Optional[Dict[str, float]]:
 
 
 def _get_pin_dims_from_bbox(pin: Any) -> Optional[Dict[str, float]]:
-    """优先方式：直接读 pin["bBox"]"""
     try:
         bbox = pin["bBox"]
     except Exception:
@@ -134,7 +135,6 @@ def _get_pin_dims_from_bbox(pin: Any) -> Optional[Dict[str, float]]:
 
 
 def _get_pin_dims_from_pad(ws: Workspace, pin: Any) -> Optional[Dict[str, float]]:
-    """兜底方式：遍历 pin.pads 或 axlDBGetPad"""
     try:
         pads = pin["pads"]
         if pads:
@@ -174,7 +174,6 @@ def _get_pin_position_from_xy(pin: Any) -> Optional[Dict[str, float]]:
 
 
 def _derive_spacing(pads: List[Dict[str, float]]) -> Dict[str, Optional[float]]:
-    """从多引脚坐标推算中心间距 spacing_x / spacing_y"""
     if len(pads) < 2:
         return {"spacing_x": None, "spacing_y": None}
 
@@ -189,9 +188,39 @@ def _derive_spacing(pads: List[Dict[str, float]]) -> Dict[str, Optional[float]]:
     return {"spacing_x": min_gap(xs), "spacing_y": min_gap(ys)}
 
 
-def _copy_pad_files_to_temp(pad_paths: List[str], temp_dir: str) -> List[str]:
-    """把 pad 文件复制到临时英文目录，返回新路径列表"""
-    new_paths = []
+def _copy_all_to_temp(
+    dra_path: str,
+    pad_paths: List[str],
+    temp_dir: str,
+) -> tuple[str, List[str], List[str]]:
+    """
+    把 .dra、同名的 .psm、以及所有 .pad 复制到临时目录。
+
+    :return: (新 dra 路径, 新 pad 路径列表, 已复制的文件列表)
+    """
+    copied: List[str] = []
+
+    # ---- 1. 复制 .dra ----
+    dra_name = os.path.basename(dra_path)
+    if _has_non_ascii(dra_name):
+        dra_name = "temp_footprint.dra"
+    new_dra = os.path.join(temp_dir, dra_name)
+    shutil.copy2(dra_path, new_dra)
+    copied.append(new_dra)
+
+    # ---- 2. 复制同名的 .psm（Allegro 打开 .dra 时会找它） ----
+    src_dir = os.path.dirname(dra_path)
+    src_stem = os.path.splitext(os.path.basename(dra_path))[0]
+    new_stem = os.path.splitext(dra_name)[0]
+    for ext in (".psm",):
+        src_psm = os.path.join(src_dir, src_stem + ext)
+        if os.path.isfile(src_psm):
+            new_psm = os.path.join(temp_dir, new_stem + ext)
+            shutil.copy2(src_psm, new_psm)
+            copied.append(new_psm)
+
+    # ---- 3. 复制所有 .pad ----
+    new_pads: List[str] = []
     for i, p in enumerate(pad_paths):
         try:
             pad_name = os.path.basename(p)
@@ -199,10 +228,12 @@ def _copy_pad_files_to_temp(pad_paths: List[str], temp_dir: str) -> List[str]:
                 pad_name = f"temp_pad_{i}.pad"
             new_p = os.path.join(temp_dir, pad_name)
             shutil.copy2(p, new_p)
-            new_paths.append(new_p)
+            new_pads.append(new_p)
+            copied.append(new_p)
         except Exception:
-            new_paths.append(p)  # 复制失败时保留原路径
-    return new_paths
+            new_pads.append(p)  # 复制失败时保留原路径
+
+    return new_dra, new_pads, copied
 
 
 def read_dra_package(
@@ -251,34 +282,26 @@ def read_dra_package(
                 "pad_files": _original_pads,
             }
 
-    # ---------- 中文路径处理 ----------
-    dra_path = _original_dra
-    pad_paths = list(_original_pads)
-
-    if _has_non_ascii(_original_dra) or any(_has_non_ascii(p) for p in _original_pads):
-        try:
-            _temp_dir = tempfile.mkdtemp(prefix="allegro_tmp_")
-
-            # 复制 .dra
-            dra_name = os.path.basename(_original_dra)
-            if _has_non_ascii(dra_name):
-                dra_name = "temp_footprint.dra"
-            temp_dra = os.path.join(_temp_dir, dra_name)
-            shutil.copy2(_original_dra, temp_dra)
-            dra_path = temp_dra
-
-            # 复制所有 .pad
-            pad_paths = _copy_pad_files_to_temp(_original_pads, _temp_dir)
-        except Exception as e:
-            if _temp_dir and os.path.isdir(_temp_dir):
-                shutil.rmtree(_temp_dir, ignore_errors=True)
-            return {
-                "error": f"中文路径复制到临时目录失败: {e}",
-                "source_file": _original_dra,
-                "pad_files": _original_pads,
-                "pads": [],
-                "unit": "mil",
-            }
+    # ---------- 总是复制到临时目录 ----------
+    # 原因：
+    #   1. 中文路径 → SKILL 解析器无法处理 \u 转义
+    #   2. 文件锁  → 用户手动用 Allegro 开着同一个 .dra 时，
+    #                 SkillBridge 直接打开会卡死（等待 Allegro 弹窗）
+    try:
+        _temp_dir = tempfile.mkdtemp(prefix="allegro_tmp_")
+        dra_path, pad_paths, _copied = _copy_all_to_temp(
+            _original_dra, _original_pads, _temp_dir
+        )
+    except Exception as e:
+        if _temp_dir and os.path.isdir(_temp_dir):
+            shutil.rmtree(_temp_dir, ignore_errors=True)
+        return {
+            "error": f"复制到临时目录失败: {e}",
+            "source_file": _original_dra,
+            "pad_files": _original_pads,
+            "pads": [],
+            "unit": "mil",
+        }
 
     # ---------- 连接 SkillBridge ----------
     ws = Workspace.open(workspace_id=workspace_id or "7777")
@@ -440,7 +463,7 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("用法: python lib_allegro_reader.py <dra路径> [pad路径1] [pad路径2] ...")
+        print("用法: python allegro_reader.py <dra路径> [pad路径1] [pad路径2] ...")
         sys.exit(1)
 
     dra = sys.argv[1]
