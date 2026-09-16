@@ -1,4 +1,0 @@
-fastmcp
-skillbridge
-PyMuPDF
-pdfplumber
