@@ -307,13 +307,16 @@ AI 拿到返回后**原样贴出 `markdown` 字段**，禁止改写、补充、�
 - `pad_file_paths` = `<pads>`
 - `semantic_result` = 第 5.4 步的 semantic_result
 - `save_report` = `True`（默认，可不传）
+- `compact` = `True`（默认，可不传）
 
-返回包含：
-- `conclusion` / `summary` / `items` / `failed` / `warned`
-- `footprint_data`（原始提取数据，本次不再使用）
+**默认精简模式（compact=True）** 返回：
+- `conclusion` / `component_type` / `summary`
 - `markdown`：**最终报告**，AI 原样贴出
-- `report_path`：JSON 报告路径
+- `report_path`：JSON 报告路径（完整明细在此文件里）
 - `save_error` / `render_error`：存档/渲染失败原因（成功时为空字符串）
+
+**调试模式（compact=False）** 额外返回：`items` / `failed` / `warned` / `footprint_data`。
+需要看逐项明细时，改传 `compact=False`；或直接读 `report_path` 的 JSON。
 
 **如果 `markdown` 为空**（渲染失败），查看 `render_error`，
 **如实报告"报告渲染失败：<原因>"**，不得自己拼表替代。
@@ -433,7 +436,7 @@ AI 拿到返回后**原样贴出 `markdown` 字段**，禁止改写、补充、�
 | `render_pdf_page` | 渲染 PDF 页为图片（客户端不支持 resource 时用） | `pdf_file_path`, `page` |
 | `validate_land_pattern_json` | 校验 AI 输出的 JSON | `raw_json` |
 | `read_full_footprint` | 提取 .dra 原始数据（pins/layers）供语义检查 | `dra_file_path` |
-| **`check_footprint_by_rules`** | **跑 6 大项数值检查 + 存档 + 渲染 markdown** | `dra_file_path`, `theoretical_payload`, `semantic_result`, `save_report` |
+| **`check_footprint_by_rules`** | **跑 6 大项数值检查 + 存档 + 渲染 markdown** | `dra_file_path`, `theoretical_payload`, `semantic_result`, `save_report`, `compact`（默认 True，精简返回） |
 
 ### 废弃工具（禁止使用）
 

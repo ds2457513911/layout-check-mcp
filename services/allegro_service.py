@@ -1,18 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-services/allegro_service.py —— Allegro 封装操作服务
+services/allegro_service.py —— Allegro 封装文件操作服务
 
 职责：
   - 扫描文件夹里的 .dra（排除 AUTOSAVE）
   - 扫描文件夹里的 .pad
-  - 读取单个 .dra 的焊盘参数（复用 lib_allegro_reader）
   - 列出文件夹概览（PDF / .dra / .pad）
+  - 列出父文件夹下的子文件夹
+
+v4.0 变更：
+  - 删除 read_one（旧版焊盘读取，返回阻焊开窗，已废弃）
+  - 不再 import services.allegro_reader
 """
 from __future__ import annotations
 
 from pathlib import Path
-
-from services.allegro_reader import read_dra_package
 
 from services.pdf_service import find_first_pdf
 
@@ -43,24 +45,6 @@ def scan_pad(folder: Path) -> list[Path]:
     return sorted(p for p in folder.glob("*.pad") if p.is_file())
 
 
-# ---------- 读取 ----------
-def read_one(
-    dra_path: str | Path,
-    pad_paths: list[str] | None = None,
-) -> dict:
-    """
-    读取单个 .dra 的焊盘参数。
-
-    :param dra_path: .dra 文件路径
-    :param pad_paths: 可选的 .pad 路径列表（仅用于溯源记录）
-    :return: lib_allegro_reader.read_dra_package 的原始返回
-    """
-    return read_dra_package(
-        dra_path=str(dra_path),
-        pad_paths=list(pad_paths or []),
-    )
-
-
 # ---------- 文件夹概览 ----------
 def list_subfolders(parent: Path) -> list[str]:
     """列出父文件夹下所有子文件夹名（按名称排序）。"""
@@ -71,7 +55,7 @@ def list_subfolders(parent: Path) -> list[str]:
         if p.is_dir() and not p.name.startswith(".")
     )
 
-    
+
 def list_folder_files(folder: Path) -> dict:
     """
     列出文件夹里的 PDF / .dra / .pad，供 AI 决策前了解文件夹内容。
@@ -105,5 +89,3 @@ def list_folder_files(folder: Path) -> dict:
         "pad_files": [str(p.resolve()) for p in pad_files],
         "error": None,
     }
-
-

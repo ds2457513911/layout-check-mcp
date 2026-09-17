@@ -1,23 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-rule_checker.py —— 基于 Excel 规范的数值规则检查 (v8)
+rule_checker.py —— 基于 Excel 规范的数值规则检查 (v9)
 
-v8 改动（本次）：
-  - `_item()` 新增两个字段：
-      · expected : 结构化"要求"值（字符串或 None），供报告渲染层直接搬运，
-                   不再需要 AI 从自由文本 rule 里猜。
-      · source   : 判据来源，取值：
-                     "default"   —— 来自 DEFAULT_RULES（Excel 设计规范）
-                     "datasheet" —— 来自传入的 theoretical_payload（规格书理论值）
-                     "self"      —— 内部一致性（同一文件内 A 处 vs B 处）
-                     None        —— NA 项或纯测量项，无判据
-  - **判定逻辑、阈值、status 计算全部未变**，只附加字段。
-    跑同一批 .dra，改动前后每项 status 必须逐项一致。
+v9 改动（本次）：
+  - 2.1 焊盘尺寸一致性：value 改为 dict，含 padstack 命名值 vs 实测值
+  - 2.3 钢网等大：value 改为 dict，含钢网尺寸 vs 焊盘尺寸
+  - 6.3 改名"Assembly 元素数"，明确它由 len(asm) 判定，
+        1 脚标识的语义存在性交给 AI 检查
+  - 6.5 改名"Silkscreen 复杂 path 数"，同上原因
+  **判定逻辑、阈值、status 计算全部未变**，只附加/改名。
+
+v8 已含（保留）：
+  - `_item()` 的 expected / source 字段
 
 v7 修复（保留）：
   - 5.2 Place_Bound 外扩量：reference 改用 Assembly 器件本体外框
-  - 5.2a：place_bound 必须覆盖所有 pin 的 bbox
-  - 5.2b：外扩量相对 Assembly 层"器件外框"计算
 
 v6 已含（保留）：
   - 元件类型识别 _classify_component
@@ -168,6 +165,11 @@ def _round(v, n=4):
     if v is None:
         return None
     return round(v, n)
+
+
+def _fmt_dim(w: float, h: float) -> str:
+    """把 width/height 转成 "1.4×1.2" 这样的字符串（用于报告显示）"""
+    return f"{_round(w, 3)}×{_round(h, 3)}"
 
 
 def _merge_bboxes(bboxes: List[List[List[float]]]) -> Optional[List[List[float]]]:
@@ -397,8 +399,14 @@ def check_pad_size(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List
             expected=None, source=None,
         )]
 
+    # ---------- 2.1 焊盘尺寸与命名一致性 ----------
+    # 收集第一个有效样本，用于报告显示
     all_match = True
     mismatch_detail = []
+    sample_named = None      # "1.4×1.2"
+    sample_actual = None     # "1.4×1.2"
+    sample_pin = None
+
     for pin in pins:
         etch = _get_etch_pad(pin)
         if etch is None:
@@ -413,22 +421,37 @@ def check_pad_size(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List
         except Exception:
             continue
         w_actual, h_actual = etch["size"]
+
+        # 记录第一个样本（用于报告显示）
+        if sample_named is None:
+            sample_named = _fmt_dim(w_named, h_named)
+            sample_actual = _fmt_dim(w_actual, h_actual)
+            sample_pin = pin.get("number")
+
         if abs(w_actual - w_named) > tol or abs(h_actual - h_named) > tol:
             all_match = False
             mismatch_detail.append(
                 f"pin{pin['number']}: 命名 {w_named}×{h_named}, 实际 {_round(w_actual)}×{_round(h_actual)}"
             )
 
+    # value 用 dict，含命名值和实测值（供报告显示）
+    v21 = {
+        "sample_pin": sample_pin,
+        "padstack": sample_named,
+        "actual": sample_actual,
+    } if sample_named is not None else None
+
     items.append(_item(
         "2.1", "焊盘尺寸与命名一致性",
         "PASS" if all_match else "FAIL",
-        value=f"容差 ±{tol}mm",
+        value=v21 if v21 else f"容差 ±{tol}mm",
         rule="焊盘实际尺寸必须与 padstack 命名匹配",
         detail=" | ".join(mismatch_detail[:3]),
         expected=f"= padstack 命名值 ±{tol}",
         source="self",
     ))
 
+    # ---------- 2.2 阻焊开窗外扩 ----------
     sm_expand_rule = cfg.get("soldermask_expand_mm", 0.05)
     sm_results = []
     for pin in pins:
@@ -464,9 +487,13 @@ def check_pad_size(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List
             expected=None, source=None,
         ))
 
+    # ---------- 2.3 钢网与焊盘等大 ----------
     if cfg.get("pastemask_equal_pad", True):
         pt_ok = True
         pt_detail = []
+        sample_pad_dim = None
+        sample_paste_dim = None
+
         for pin in pins:
             etch = _get_etch_pad(pin)
             pt = _get_pad_by_layer(pin, "PIN/PASTEMASK_TOP")
@@ -474,15 +501,24 @@ def check_pad_size(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List
                 continue
             ew, eh = etch["size"]
             pw, ph = pt["size"]
+            if sample_pad_dim is None:
+                sample_pad_dim = _fmt_dim(ew, eh)
+                sample_paste_dim = _fmt_dim(pw, ph)
             if abs(pw - ew) > 0.02 or abs(ph - eh) > 0.02:
                 pt_ok = False
                 pt_detail.append(
                     f"pin{pin['number']}: 焊盘 {_round(ew)}×{_round(eh)}, 钢网 {_round(pw)}×{_round(ph)}"
                 )
+
+        v23 = {
+            "pad": sample_pad_dim,
+            "paste": sample_paste_dim,
+        } if sample_pad_dim is not None else None
+
         items.append(_item(
             "2.3", "钢网与焊盘等大",
             "PASS" if pt_ok else "WARN",
-            value="等大" if pt_ok else "不等大",
+            value=v23 if v23 else ("等大" if pt_ok else "不等大"),
             rule="Chip 元件钢网开窗与焊盘等大",
             detail=" | ".join(pt_detail[:3]),
             expected="钢网 = 焊盘",
@@ -850,14 +886,17 @@ def check_assembly(data: Dict, rules: Dict) -> List[Dict]:
         source="default",
     ))
 
-    has_pin1 = len(asm) >= 2
+    # 6.3：只检查元素数量（1 脚标识的语义存在性由 AI 检查负责）
     items.append(_item(
-        "6.3", "Assembly 有 1 脚标识",
-        "PASS" if has_pin1 else "WARN",
+        "6.3", "Assembly 元素数",
+        "PASS" if has_content else "WARN",
         value=f"{len(asm)} 个元素",
-        rule="Assembly 层应有 1 脚标识",
-        detail="" if has_pin1 else "只有 1 个元素",
-        expected="有 1 脚标识",
+        rule="Assembly 层应有 ≥2 个元素（外框 + 1 脚标识）",
+        detail=(
+            "1 脚标识的存在性由 AI 语义检查判定"
+            if has_content else "只有 1 个元素"
+        ),
+        expected="≥ 2 元素",
         source="default",
     ))
 
@@ -886,14 +925,19 @@ def check_silkscreen(data: Dict, rules: Dict) -> List[Dict]:
         return items
 
     complex_paths = [p for p in silk if p.get("n_segs", 0) >= 3]
-    has_pin1_marker = len(complex_paths) > 0
+    has_complex = len(complex_paths) > 0
+
+    # 6.5：只检查复杂 path 数量（1 脚标识的语义存在性由 AI 检查负责）
     items.append(_item(
-        "6.5", "Silkscreen 有 1 脚标识",
-        "PASS" if has_pin1_marker else "WARN",
+        "6.5", "Silkscreen 复杂 path 数",
+        "PASS" if has_complex else "WARN",
         value=f"{len(complex_paths)} 个复杂 path",
-        rule="Silkscreen 层应有 1 脚标识",
-        detail="" if has_pin1_marker else "未找到 1 脚标识",
-        expected="有 1 脚标识",
+        rule="Silkscreen 层应有 ≥1 个复杂 path（n_segs≥3，可能为 1 脚标识）",
+        detail=(
+            "1 脚标识的存在性由 AI 语义检查判定"
+            if has_complex else "未找到复杂 path"
+        ),
+        expected="≥ 1 个",
         source="default",
     ))
 

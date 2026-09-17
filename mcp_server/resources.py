@@ -5,10 +5,6 @@ mcp_server/resources.py —— MCP 资源定义
 Resource 的作用是把"数据"暴露给客户端 AI 读。
 AI 通过读 resource 拿到 PDF 页图片后，可以用自己的多模态能力提取参数。
 
-说明：
-  - 已移除 marker image resource（marker 引擎已删除）
-  - 只保留 PyMuPDF 整页图 resource 和 PDF 元信息 resource
-
 URI 约定：
   datasheet://{pdf_stem}/page/{page}          PyMuPDF 整页图（PNG）
   datasheet://{pdf_stem}/info                 PDF 元信息（JSON 字符串）
@@ -36,7 +32,7 @@ def register(mcp: FastMCP) -> None:
         返回 PDF 指定页的整页图片（PNG 字节）。
 
         渲染引擎固定为 PyMuPDF。
-        如果客户端不支持 image resource，请改用其他方式获取图片路径。
+        如果客户端不支持 image resource，请改用 render_pdf_page tool。
         """
         pdf = pdf_service.resolve_pdf(pdf_stem, config.PDF_SEARCH_ROOTS)
         if pdf is None:
@@ -44,7 +40,7 @@ def register(mcp: FastMCP) -> None:
         img_path = pdf_service.get_or_render_image(
             pdf_path=pdf,
             page=int(page),
-            out_root=config.MARKER_ROOT,
+            out_root=config.RENDER_OUTPUT_ROOT,
             engine="pymupdf",
         )
         if img_path is None or not img_path.is_file():

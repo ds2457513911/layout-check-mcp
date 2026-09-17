@@ -10,22 +10,22 @@ mcp_server/tools.py —— MCP 工具定义
 
   严禁在 tool 里写业务逻辑（循环、文件扫描、JSON 清洗）。
 
-工具列表（v3.1）：
-  - list_subfolders / list_folder_files
-  - locate_land_pattern_page / render_pdf_page
-  - read_allegro_footprint（旧，废弃）
-  - read_full_footprint（主流程用：拿 pins/layers 供 AI 语义检查）
-  - check_footprint_by_rules（主用：内部自动存档 + 渲染 markdown）
-  - validate_land_pattern_json
-  - check_land_pattern_tolerance（旧，废弃）
-  - save_tolerance_report（旧，废弃）
+工具列表（v4.1）：
+  - list_subfolders / list_folder_files         批量侦察
+  - locate_land_pattern_page / render_pdf_page  定位 & 渲染
+  - read_full_footprint                         拿 pins/layers 供 AI 语义检查
+  - check_footprint_by_rules                    主用：检查 + 存档 + 渲染 markdown
+  - validate_land_pattern_json                  校验 AI 输出的 JSON
 
-v3.1 变更：
-  - check_footprint_by_rules 新增 semantic_result / save_report 两个参数
-    内部自动：保存 JSON 报告 + 渲染固定 markdown
-  - 删除独立 render_report tool
-    （原因：MCP tool 之间不共享变量，13KB 大对象无法可靠传递）
-  - 删除独立 save_checklist_report tool（功能已内联进 check_footprint_by_rules）
+v4.1 变更：
+  - check_footprint_by_rules 新增 compact 参数（默认 True）：
+      · compact=True  → 返回 conclusion / summary / markdown / report_path
+                        / save_error / render_error，丢掉 items / failed
+                        / warned / footprint_data（省 LLM 输入 token）
+      · compact=False → 保留完整 items / failed / warned / footprint_data
+                        （调试用）
+      · 边界：save_report=False 时，compact 自动降级为 False（否则返回无用）
+      · 错误分支：数据提取失败时，无论 compact 传什么，都返回完整错误信息
 """
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from mcp_server import config
-from services import allegro_service, footprint_service, pdf_service
+from services import allegro_service, pdf_service
 from services import footprint_extractor, rule_checker, report_renderer
 from shared.json_utils import coerce_numeric, extract_json_body
 from shared.validation import validate_land_pattern
@@ -54,7 +54,7 @@ def _write_checklist_json(
     """
     把一次清单检查的结果写成 JSON 文件。
 
-    从 check_footprint_by_rules 内部调用，也可被独立调试脚本复用。
+    从 check_footprint_by_rules 内部调用。
 
     :param result: check_footprint_by_rules 的结果（含 conclusion/summary/items）
     :param dra_file_path: .dra 路径；None 时从 result.footprint_data 推断
@@ -130,9 +130,8 @@ def register(mcp: FastMCP) -> None:
         :param parent_path: 父文件夹路径
         :return: {"parent": str, "subfolders": [str], "count": int}
         """
-        from services.folder_service import list_subfolders as _ls
         p = Path(parent_path)
-        subs = _ls(p)
+        subs = allegro_service.list_subfolders(p)
         return {
             "parent": str(p.resolve()),
             "subfolders": subs,
@@ -217,7 +216,7 @@ def register(mcp: FastMCP) -> None:
         img_path = pdf_service.get_or_render_image(
             pdf_path=pdf,
             page=page,
-            out_root=config.MARKER_ROOT,
+            out_root=config.RENDER_OUTPUT_ROOT,
             engine=render_engine,
         )
         if img_path is None:
@@ -231,30 +230,7 @@ def register(mcp: FastMCP) -> None:
         }
 
     # ============================================================
-    # Tool 3: 读取 Allegro 实际封装（旧版：只读焊盘）
-    # ============================================================
-    @mcp.tool()
-    def read_allegro_footprint(
-        dra_file_path: str,
-        pad_file_paths: list[str] | None = None,
-    ) -> dict:
-        """
-        【已废弃】通过 SkillBridge 读取 Allegro .dra 封装的实际焊盘参数（简化版）。
-
-        只返回焊盘尺寸 + 间距。返回的是 pin.b_box（阻焊开窗），非铜箔尺寸。
-        焊盘尺寸比对请使用 check_footprint_by_rules。
-
-        :param dra_file_path: .dra 文件完整路径
-        :param pad_file_paths: 可选的 .pad 文件路径列表（仅用于溯源记录）
-        :return: 适配 check_land_pattern_tolerance 的 actual_payload
-        """
-        return allegro_service.read_one(
-            dra_path=dra_file_path,
-            pad_paths=pad_file_paths,
-        )
-
-    # ============================================================
-    # Tool 3b: 全量读取 Allegro 封装（主流程用：拿 pins/layers 供语义检查）
+    # Tool 3: 全量读取 Allegro 封装（拿 pins/layers 供 AI 语义检查）
     # ============================================================
     @mcp.tool()
     def read_full_footprint(
@@ -290,7 +266,7 @@ def register(mcp: FastMCP) -> None:
         )
 
     # ============================================================
-    # Tool 3c: 跑规则检查 + 存档 + 渲染 markdown（主用）
+    # Tool 3b: 跑规则检查 + 存档 + 渲染 markdown（主用）
     # ============================================================
     @mcp.tool()
     def check_footprint_by_rules(
@@ -300,6 +276,7 @@ def register(mcp: FastMCP) -> None:
         custom_rules: dict | None = None,
         semantic_result: dict | None = None,
         save_report: bool = True,
+        compact: bool = True,
     ) -> dict:
         """
         从 .dra 提取封装数据，跑完整的数值规则检查，并自动保存 JSON 报告、
@@ -329,20 +306,18 @@ def register(mcp: FastMCP) -> None:
             }
             缺字段或 None 时，渲染层会跳过对应行，不崩。
         :param save_report: 是否保存 JSON + 渲染 markdown；默认 True
-        :return: {
-            "conclusion": "PASS" | "FAIL" | "REVIEW_REQUIRED",
-            "component_type": "ic" | "chip" | "connector" | "unknown",
-            "summary": {...},
-            "items": [...],
-            "failed": [...],
-            "warned": [...],
-            "footprint_data": {...},
-            "markdown": str,       # 最终报告，AI 原样贴出
-            "report_path": str,    # JSON 报告路径（save_report=False 时为空）
-            "save_error": str,     # 存档失败原因（成功时为空）
-            "render_error": str,   # 渲染失败原因（成功时为空）
-        }
+        :param compact: 是否精简返回（默认 True）
+            - True  → 只返回 conclusion / summary / markdown / report_path
+                      / save_error / render_error
+            - False → 额外返回 items / failed / warned / footprint_data
+            - save_report=False 时，compact 强制为 False（否则返回无意义）
+        :return: 见上方字段说明。
         """
+        # ---------- 边界：save_report=False 时 compact 无意义，强制降级 ----------
+        # 原因：没有 markdown、没有 report_path，再丢掉 items 就只剩空壳
+        if not save_report:
+            compact = False
+
         # 1. 提取数据
         fp_data = footprint_extractor.read_full_footprint(
             dra_path=dra_file_path,
@@ -350,6 +325,7 @@ def register(mcp: FastMCP) -> None:
             workspace_id=config.SKILLBRIDGE_WORKSPACE_ID,
         )
         if fp_data.get("error"):
+            # 数据提取失败：无论 compact 传什么，都返回完整错误信息
             return {
                 "conclusion": "FAIL",
                 "error": fp_data["error"],
@@ -367,7 +343,7 @@ def register(mcp: FastMCP) -> None:
             rules=custom_rules,
         )
 
-        # 3. 附上原始提取数据
+        # 3. 附上原始提取数据（存档需要它，存档完成后可能被裁掉）
         result["footprint_data"] = fp_data
 
         # 4. 存档 + 渲染（容错：任一失败不影响检查结果返回）
@@ -396,6 +372,20 @@ def register(mcp: FastMCP) -> None:
             except Exception as e:
                 render_error = str(e)
 
+        # 5. 组装返回
+        if compact:
+            # 精简模式：只留必要字段
+            return {
+                "conclusion": result.get("conclusion"),
+                "component_type": result.get("component_type"),
+                "summary": result.get("summary"),
+                "markdown": markdown,
+                "report_path": report_path,
+                "save_error": save_error,
+                "render_error": render_error,
+            }
+
+        # 完整模式：保留全部字段
         result["markdown"] = markdown
         result["report_path"] = report_path
         result["save_error"] = save_error
@@ -427,61 +417,3 @@ def register(mcp: FastMCP) -> None:
         parsed = coerce_numeric(parsed)
         valid, errors, normalized = validate_land_pattern(parsed)
         return {"valid": valid, "errors": errors, "normalized": normalized}
-
-    # ============================================================
-    # Tool 5: 公差比对（旧版，保留兼容）
-    # ============================================================
-    @mcp.tool()
-    def check_land_pattern_tolerance(
-        theoretical_payload: dict,
-        actual_payload: dict,
-        tolerance: dict | None = None,
-    ) -> dict:
-        """
-        【已废弃】理论焊盘参数 vs Allegro 实际封装参数 公差比对。
-
-        废弃原因：依赖 read_allegro_footprint 的数据（阻焊开窗），
-        会与 datasheet 的铜箔尺寸比对出假 delta，导致 FAIL 误判。
-        请使用 check_footprint_by_rules。
-
-        :param theoretical_payload: 形如 {theoretical_land_params: {...}} 的完整结构
-        :param actual_payload: 来自 read_allegro_footprint 的返回
-        :param tolerance: 公差配置；不传则用默认
-        :return: PASS/FAIL/NA + 逐 pin 明细 + 汇总 + conclusion
-        """
-        return footprint_service.check_tolerance(
-            theoretical_payload=theoretical_payload,
-            actual_payload=actual_payload,
-            tolerance=tolerance,
-        )
-
-    # ============================================================
-    # Tool 6: 保存公差报告（旧版，保留兼容）
-    # ============================================================
-    @mcp.tool()
-    def save_tolerance_report(
-        comparison_result: dict,
-        theoretical_payload: dict | None = None,
-        actual_payload: dict | None = None,
-        output_dir: str | None = None,
-        filename: str | None = None,
-    ) -> dict:
-        """
-        【已废弃】把一次焊盘公差检查的结果写成 JSON 文件。
-
-        已被 check_footprint_by_rules 内部的自动存档取代。
-
-        :param comparison_result: check_land_pattern_tolerance 的完整返回
-        :param theoretical_payload: 可选，理论 payload
-        :param actual_payload: 可选，实际 payload
-        :param output_dir: 输出目录；不传时自动用 .dra 所在目录
-        :param filename: 文件名；不传时自动带时间戳
-        :return: {"ok": bool, "path": str, "error": str}
-        """
-        return footprint_service.save_report(
-            comparison_result=comparison_result,
-            theoretical_payload=theoretical_payload,
-            actual_payload=actual_payload,
-            output_dir=output_dir,
-            filename=filename,
-        )

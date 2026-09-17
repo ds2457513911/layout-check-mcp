@@ -10,6 +10,13 @@ services/report_renderer.py —— 把数值检查 + 语义检查渲染成固定
 输出：
   Markdown 字符串（固定格式，AI 原样贴出，不得改写）
 
+v2 变更：
+  - 1.1 前缀：只显示前缀（如 nb_），不再显示完整封装名
+  - 1.3 含数字：只显示 有/无，不再列具体数字
+  - 2.1 尺寸一致性：显示 padstack 命名值 vs 实测值（来自 value dict）
+  - 2.3 钢网等大：显示钢网尺寸 vs 焊盘尺寸（来自 value dict）
+  - 命名语义行：pitch 未在名字编码时，显示"N 项一致（pitch 未含）"
+
 设计原则：
   - 格式完全由 Python 控制，AI 零自由度 → 跨封装、跨轮次完全一致
   - 按大项分组：1 命名 / 2 焊盘 / 3 间距原点 / 4 pin number / 5 Place_Bound / 6 Assembly+Silk
@@ -83,6 +90,23 @@ def _fmt_num(v: Any) -> str:
 
 
 # ============================================================
+# 辅助：从完整封装名提取前缀
+# ============================================================
+def _extract_prefix(name: Any) -> str:
+    """
+    从封装名里提取前缀（如 "nb_xtal4..." → "nb_"）。
+
+    规则：取第一个下划线及之前的部分（含下划线）。
+    若没有下划线，返回原字符串。
+    """
+    if not isinstance(name, str) or not name:
+        return "—"
+    if "_" in name:
+        return name.split("_", 1)[0] + "_"
+    return name
+
+
+# ============================================================
 # "实测"列：按 item.id 分发
 # ============================================================
 def _format_actual(item: dict) -> str:
@@ -100,17 +124,23 @@ def _format_actual(item: dict) -> str:
 
     # ---------- 大项 1 ----------
     if id_ == "1.1":
-        return _esc(value) if value else "—"
+        # 只显示前缀（如 nb_），不显示完整名字
+        return _esc(_extract_prefix(value))
     if id_ == "1.2":
         return "有" if status == "FAIL" else "无"
     if id_ == "1.3":
-        if isinstance(value, list) and value:
-            return ", ".join(str(v) for v in value)
-        return "无"
+        # 只显示有/无，不列具体数字
+        return "无" if not value else "有"
 
     # ---------- 大项 2 ----------
     if id_ == "2.1":
-        # 焊盘尺寸 vs padstack 命名：只报一致/不一致
+        # 显示 padstack 命名值 vs 实测值
+        if isinstance(value, dict):
+            padstack = value.get("padstack")
+            actual = value.get("actual")
+            if padstack is not None and actual is not None:
+                return f"padstack {_esc(padstack)} / 实测 {_esc(actual)}"
+        # 兼容旧 value（纯字符串）：退化显示
         return "一致" if status == "PASS" else "不一致"
     if id_ == "2.2":
         if isinstance(value, dict):
@@ -119,6 +149,13 @@ def _format_actual(item: dict) -> str:
             return f"x {x} / y {y}"
         return "—"
     if id_ == "2.3":
+        # 显示钢网尺寸 vs 焊盘尺寸
+        if isinstance(value, dict):
+            pad = value.get("pad")
+            paste = value.get("paste")
+            if pad is not None and paste is not None:
+                return f"钢网 {_esc(paste)} / 焊盘 {_esc(pad)}"
+        # 兼容旧 value（"等大"/"不等大"）
         return _esc(value) if value else "—"
 
     # ---------- 大项 3 ----------
@@ -170,10 +207,12 @@ def _format_actual(item: dict) -> str:
             return f"{n} 元素" if n else "—"
         return "—"
     if id_ == "6.3":
+        # Assembly 元素数（由 len(asm) 判定；1 脚标识存在性由 AI 语义检查负责）
         return _esc(value) if value else "—"
     if id_ == "6.4":
         return f"{_fmt_num(value)} 元素" if value else "无"
     if id_ == "6.5":
+        # Silkscreen 复杂 path 数（由 n_segs>=3 的 path 数量判定）
         return _esc(value) if value else "—"
     if id_ == "6.6":
         if status == "FAIL":
@@ -236,6 +275,11 @@ def _naming_semantic_row(semantic_result: Optional[dict]) -> Optional[dict]:
     """
     从 semantic_result.naming 生成一行"命名语义 vs datasheet"。
     未提供该字段时返回 None（不显示此行）。
+
+    显示规则：
+      - 4 项全检且全过 → "全部一致"
+      - 只检了部分（如名字未含 pitch）→ "N 项一致（X、Y 未含）"
+      - 有失败项 → "不一致：X、Y"
     """
     nm = (semantic_result or {}).get("naming")
     if not isinstance(nm, dict):
@@ -247,14 +291,18 @@ def _naming_semantic_row(semantic_result: Optional[dict]) -> Optional[dict]:
         ("尺寸", nm.get("dimension_match")),
         ("pitch", nm.get("pitch_match")),
     ]
-    # None 表示 datasheet 未提供该维度，不参与判定
+    # None 表示该维度不适用（名字未含 / datasheet 未提供），不参与判定
     bad = [name for name, ok in checks if ok is False]
     checked = [name for name, ok in checks if ok is not None]
     if not checked:
         return None
 
     if not bad:
-        actual = "全部一致"
+        if len(checked) == len(checks):
+            actual = "全部一致"
+        else:
+            missing = [name for name, ok in checks if ok is None]
+            actual = f"{len(checked)} 项一致（{'、'.join(missing)} 未含）"
         status = "PASS"
     else:
         actual = "不一致：" + "、".join(bad)
