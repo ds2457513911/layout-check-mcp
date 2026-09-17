@@ -3,9 +3,8 @@ build/
 *.egg-info/
 *.pyc
 __pycache__/
-
-# uv 锁文件（不提交）
-uv.lock
+.cleanup_backup/
+Data/
 
 # 本地调试/诊断脚本（不发布）
 Tools/

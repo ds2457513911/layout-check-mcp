@@ -29,3 +29,6 @@ DEFAULT_TOLERANCE = {
     "spacing_x": {"min": -0.15, "max": 0.15},
     "spacing_y": {"min": -0.15, "max": 0.15},
 }
+
+# SkillBridge workspace id（MCP tool 调用 Allegro 时使用）
+SKILLBRIDGE_WORKSPACE_ID = "7777"
