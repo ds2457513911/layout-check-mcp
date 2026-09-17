@@ -14,7 +14,7 @@ compatibility: >
   layout-check-v2 MCP server. Vision extraction is performed by the client LLM.
 metadata:
   author: layout-team
-  version: "2.0.0"
+  version: "2.3.0"
   category: hardware-layout
 requires-mcp-servers:
   - name: layout-check-v2
@@ -58,6 +58,25 @@ requires-mcp-servers:
 
 **分界线**：凡是能用数字精确算的，交给 MCP；凡是需要"看懂图纸"的，交给 AI。
 
+### 焊盘尺寸比对的数据源（重要）
+
+比对"焊盘尺寸 vs datasheet 理论值"时，**必须使用 ETCH/TOP 层的铜箔尺寸**。
+
+`.dra` 里同一焊盘有多层尺寸：
+- **ETCH/TOP** = 铜箔焊盘（**用这个和 datasheet 比**）
+- **PIN/SOLDERMASK_TOP** = 阻焊开窗（通常比铜箔单边大 0.05mm，**不参与理论比对**）
+- **PIN/PASTEMASK_TOP** = 钢网（通常与铜箔等大）
+
+`read_allegro_footprint` 返回的是 `pin.b_box`（整层最大 bbox），
+**通常是阻焊开窗尺寸**，比铜箔大 0.1mm，会导致误判。
+因此**禁止使用 `read_allegro_footprint`**，必须用 `check_footprint_by_rules`。
+
+### 报告渲染（重要）
+
+最终报告由 `check_footprint_by_rules` 内部的 `render_markdown` 生成，
+AI 拿到返回后**原样贴出 `markdown` 字段**，禁止改写、补充、解释。
+格式完全由 Python 控制。
+
 ## 前置条件
 
 1. **MCP 服务器**：`layout-check-v2` 已连接。
@@ -84,9 +103,11 @@ requires-mcp-servers:
 批量任务分 4 阶段：**侦察 → 规划 → 执行 → 汇总**。
 
 ### B0. 侦察
+
 调用 `list_subfolders(parent_path)` 列出所有子文件夹，对每个子文件夹调用 `list_folder_files` 记录 PDF/.dra/.pad 情况。输出侦察清单（哪些可检查、哪些跳过）。
 
 ### B1. 规划
+
 根据可检查封装数分批：
 
 | 封装数 | 策略 |
@@ -97,12 +118,14 @@ requires-mcp-servers:
 | 16+ | 必须分批，每批 5 个 |
 
 ### B2. 执行
+
 - 维护进度表（✅ 完成 / ⏳ 进行中 / ⏸️ 待处理 / ❌ 失败）
 - 每个封装完成后**立即输出报告**，不要攒到最后
 - 失败不阻断：记录原因，继续下一个
 - **每完成 5 个主动汇报进度**
 
 ### B3. 汇总
+
 所有封装完成后，输出：
 - 结论分布表（PASS / FAIL / REVIEW_REQUIRED / FAILED / SKIPPED）
 - 失败明细
@@ -138,8 +161,10 @@ requires-mcp-servers:
 1. 读 resource `datasheet://<pdf_stem>/page/<page>` 拿到 PDF 该页图片
 2. 按下方"提取规则"读图，输出 JSON
 3. 调用 `validate_land_pattern_json` 校验
-4. 校验通过 → 包装成 `{"theoretical_land_params": <normalized>}`
+4. 校验通过 → 保留为 `theoretical_payload`（第 6 步要用）
 5. 校验失败 → 根据 errors 修正后重试，最多 2 次
+
+**如果客户端不支持读 MCP resource**：调用 `render_pdf_page(pdf_file_path=<pdf>, page=<page>)` 拿到图片路径，再读图。
 
 #### 提取规则
 
@@ -162,8 +187,6 @@ requires-mcp-servers:
 
 #### 输出格式
 
-输出严格 JSON：
-
     {
       "unit": "mm",
       "pads": [{"pin": 1, "width": 1.4, "height": 1.2}],
@@ -178,264 +201,249 @@ requires-mcp-servers:
       "note": ""
     }
 
-### 第 4 步：跑 .dra 数值规则检查（MCP 负责）
+### 第 4 步：提取 .dra 原始数据（供语义检查用）
+
+调用 `read_full_footprint(dra_file_path=<dra>, pad_file_paths=<pads>)`。
+
+返回里提取：
+- `symbol_name`：封装名（第 5.1 步语义检查用）
+- `pins`：所有 pin 的 number / xy / bbox / pads（第 5.2 步语义检查用）
+- `layers`：assembly_top / silkscreen_top / place_bound_top 等（第 5.3 步语义检查用）
+
+**如果返回 `error`，停下来报告**，不得跳过或自己写 Python 替代。
+
+### 第 5 步：AI 语义检查（AI 负责）
+
+用第 4 步的 `pins` / `layers` + datasheet 图片，做 3 组语义判断，
+最终产出一个 `semantic_result` JSON（第 6 步要用）。
+
+#### 5.1 命名规范语义检查
+
+**输入**：
+- 封装名字：`read_full_footprint` 返回的 `symbol_name`
+- datasheet 图片：`datasheet://<pdf_stem>/page/<page>`（或 `render_pdf_page`）
+
+**检查项**：
+
+1. **类型对比**：名字里的封装类型标识（如 SOD-323、QFN48、HDMI19）与 datasheet 实际类型是否一致？
+2. **引脚数对比**：名字里的数字是否包含 datasheet 的引脚数？
+3. **尺寸对比**：名字里的尺寸（如 2D7X1D4X0D75 = 2.7×1.4×0.75 mm）与 datasheet 外形尺寸是否一致？
+4. **pitch 对比**：名字里的 pitch（如 0D5 = 0.5mm）与 datasheet 是否一致？
+
+**输出**（放入 `semantic_result.naming`）：
+
+    {
+      "type_match": true,
+      "pin_count_match": true,
+      "dimension_match": true,
+      "pitch_match": true
+    }
+
+**注意**：datasheet 没写的维度填 null，不要编造。
+
+#### 5.2 pin number 语义检查
+
+**输入**：
+- datasheet 图片：`datasheet://<pdf_stem>/page/<page>`
+- `.dra` 的 pins：`read_full_footprint` 返回的 `pins`
+
+**检查项**：
+
+1. **pin 数量**：datasheet 声明的 pin 数与 `.dra` 是否一致？
+2. **pin 编号**：每个 pin 编号是否一致？缺号/重号/多余？
+3. **pin 功能**：如果 datasheet 有 pin function 表，顺序是否对应正确？
+
+**输出**（放入 `semantic_result.pin_number`）：
+
+    {
+      "dra_pin_count": 4,
+      "datasheet_pin_count": 4,
+      "count_match": true,
+      "pin_numbers_match": true
+    }
+
+#### 5.3 极性标识检查
+
+**输入**：
+- datasheet 图片：`datasheet://<pdf_stem>/page/<page>`
+- Assembly / Silkscreen 层元素：`read_full_footprint` 返回的 `layers`
+
+**检查项**：
+
+1. **1 脚标识**：Assembly 和 Silkscreen 是否都有？（三角形、圆圈、斜杠、数字 "1" 等）
+2. **极性标识**（有极性元件：二极管、电解电容）：
+   - 二极管：竖线端为负极（K），或有 +/- 标识
+   - 电解电容：+ 号标识
+3. **层一致性**：Assembly 和 Silkscreen 的标识方向一致吗？
+
+**输出**（放入 `semantic_result.polarity`）：
+
+    {
+      "required": false,
+      "pin1_marker_assembly": true,
+      "pin1_marker_silkscreen": true
+    }
+
+**注意**：
+- 无极性元件（电阻、普通电容、晶振）→ `required = false`
+- 有极性元件但 `.dra` 没标识 → `pin1_marker_* = false`
+
+#### 5.4 组装 semantic_result
+
+把 3 组结果合成一个对象：
+
+    {
+      "naming": { ... 5.1 的输出 ... },
+      "pin_number": { ... 5.2 的输出 ... },
+      "polarity": { ... 5.3 的输出 ... }
+    }
+
+### 第 6 步：跑检查 + 存档 + 渲染报告
 
 调用 `check_footprint_by_rules`：
 
 - `dra_file_path` = `<dra>`
 - `theoretical_payload` = 第 3 步的返回
 - `pad_file_paths` = `<pads>`
+- `semantic_result` = 第 5.4 步的 semantic_result
+- `save_report` = `True`（默认，可不传）
 
-返回 17 项数值检查结果，覆盖 6 大项里的**可量化部分**：
+返回包含：
+- `conclusion` / `summary` / `items` / `failed` / `warned`
+- `footprint_data`（原始提取数据，本次不再使用）
+- `markdown`：**最终报告**，AI 原样贴出
+- `report_path`：JSON 报告路径
+- `save_error` / `render_error`：存档/渲染失败原因（成功时为空字符串）
 
-| 大项 | 数值检查内容 |
-|---|---|
-| 1. 命名规范 | 前缀、小数点、数字 |
-| 2. 焊盘尺寸 | 与 padstack 命名一致性、阻焊外扩、钢网等大 |
-| 3. 间距与原点 | pin pitch、最小间距、原点居中 |
-| 5. Place_Bound | 存在、覆盖焊盘、外扩量 |
-| 6. Assembly / Silkscreen | 存在、1 脚标识、不与焊盘重叠 |
+**如果 `markdown` 为空**（渲染失败），查看 `render_error`，
+**如实报告"报告渲染失败：<原因>"**，不得自己拼表替代。
 
-**这一步骤返回的 `footprint_data` 字段包含 `.dra` 的原始数据**，第 5 步需要用到。
+### 第 7 步：输出报告
 
-### 第 5 步：AI 语义检查（AI 负责）
+**原样贴出第 6 步返回的 `markdown` 字段**。
 
-数值做不了的语义判断，由 AI 做。**分 3 个子步骤**。
+禁止：
+- 在 markdown 前后添加任何文字（包括"结论"、"建议"、"已保存到"）
+- 改写表格中的任何字符
+- 补充解释
 
-#### 5.1 命名规范语义检查
-
-**任务**：检查封装名字是否符合规范，并与 datasheet 对比。
-
-**输入**：
-- 封装名字：`footprint_data.symbol_name`
-- datasheet 图片：`datasheet://<pdf_stem>/page/<page>`
-
-**检查项**：
-
-1. **类型对比**：名字里的封装类型标识（如 SOD-323、QFN48、HDMI19、FPC10）与 datasheet 实际类型是否一致？
-2. **引脚数对比**：名字里的数字是否包含 datasheet 的引脚数？
-3. **尺寸对比**：名字里的尺寸（如 2D7X1D4X0D75 = 2.7×1.4×0.75 mm）与 datasheet 外形尺寸是否一致？
-4. **pitch 对比**：名字里的 pitch（如 0D5 = 0.5mm）与 datasheet 是否一致？
-
-**输出 JSON**：
-
-    {
-      "type_match": true,
-      "pin_count_match": true,
-      "dimension_match": true,
-      "pitch_match": true,
-      "parsed_name": {
-        "prefix": "nb_",
-        "type": "SOD-323",
-        "pin_count": 2,
-        "dimensions": [2.7, 1.4, 0.75],
-        "pitch": null,
-        "special": null
-      },
-      "datasheet_actual": {
-        "type": "SOD-323",
-        "pin_count": 2,
-        "dimensions": [2.7, 1.4, 0.75],
-        "pitch": null
-      },
-      "issues": [],
-      "note": ""
-    }
-
-**注意**：datasheet 没写的字段填 null，issues 里说明"datasheet 未提供"。
-
-#### 5.2 pin number 语义检查
-
-**任务**：对比 datasheet 的 pin 定义和 `.dra` 里的 pin 列表。
-
-**输入**：
-- datasheet 图片：`datasheet://<pdf_stem>/page/<page>`
-- `.dra` 的 pins：`footprint_data.pins`（JSON 字符串）
-
-**检查项**：
-
-1. **pin 数量**：datasheet 声明的 pin 数与 `.dra` 是否一致？
-2. **pin 编号**：每个 pin 编号是否一致？缺号/重号/多余？
-3. **pin 功能**：如果 datasheet 有 pin function 表（GND/VCC/NC/IO 等），顺序是否对应正确？
-
-**输出 JSON**：
-
-    {
-      "dra_pin_count": 2,
-      "datasheet_pin_count": 2,
-      "count_match": true,
-      "pin_numbers_match": true,
-      "missing_pins": [],
-      "extra_pins": [],
-      "renumbered_pins": [],
-      "function_mismatches": [],
-      "issues": [],
-      "note": ""
-    }
-
-#### 5.3 极性标识检查
-
-**任务**：检查 Assembly / Silkscreen 层的 1 脚标识和极性标识。
-
-**输入**：
-- datasheet 图片：`datasheet://<pdf_stem>/page/<page>`
-- Assembly / Silkscreen 层元素：`footprint_data.layers`（JSON 字符串）
-
-**检查项**：
-
-1. **1 脚标识**：Assembly 和 Silkscreen 是否都有？（三角形、圆圈、斜杠、数字 "1" 等）
-2. **极性标识**（有极性元件：二极管、电解电容、IC）：
-   - 二极管：竖线端为负极（K），或有 +/- 标识
-   - 电解电容：+ 号标识
-   - IC：pin 1 标识足够
-3. **层一致性**：Assembly 和 Silkscreen 的标识方向一致吗？
-
-**输出 JSON**：
-
-    {
-      "pin1_marker": {
-        "assembly": true,
-        "silkscreen": true,
-        "evidence": "Assembly 层有三角形 1 脚标识"
-      },
-      "polarity_marker": {
-        "required": false,
-        "assembly": null,
-        "silkscreen": null,
-        "evidence": ""
-      },
-      "issues": [],
-      "note": ""
-    }
-
-**注意**：
-- datasheet 显示是无极性元件（电阻、普通电容）→ `polarity_marker.required = false`
-- datasheet 显示有极性元件但 `.dra` 没标识 → issues 里说明
-
-### 第 6 步：合并报告
-
-把数值检查（17 项）和语义检查（3 组）合并。
-
-**结论优先级**：
-
-| 情况 | 结论 |
-|---|---|
-| 任一 FAIL | **FAIL** |
-| 有 NA | **REVIEW_REQUIRED** |
-| 只有 WARN | **PASS**（附警告） |
-| 全 PASS | **PASS** |
-
-**关键规则**：
-- **数值检查的结论优先信 Python**——AI 不要凭感觉推翻
-- **AI 语义检查和 Python 结果冲突时，以 Python 为准**
-- **不要编造数据**——datasheet 里没有的信息如实说"未提供"
-
-### 第 7 步：保存 JSON 报告
-
-调用 `save_checklist_report`：
-
-- `checklist_result` = 第 6 步合并后的结果
-- `dra_file_path` = `<dra>`
-- `output_dir` 不传（自动写到 `.dra` 所在目录）
-
-返回后，在报告里注明"已保存报告到 `<path>`"。
+流程结束。
 
 ---
 
 ## 报告格式
 
-### 单封装报告
+报告由 `check_footprint_by_rules` 内部的 `render_markdown` 生成，AI **原样贴出 markdown 字段**。
 
-    ## 封装检查报告
+### 渲染结果示例
 
-    **封装：** <symbol_name>
-    **路径：** <dra 完整路径>
-    **元件类型：** IC / chip / connector / unknown
+    ## nb_xtal4_3d2x2d5x0d7 — ✅ PASS
 
-    ### 1. 封装命名规范
+    数值 19（18✅ 1⚠️，单位 mm）｜报告 checklist_report_20260917_110517.json
 
-    - [PASS] 前缀 NB_
-    - [WARN] 前缀大小写（实际 nb_，规范要求 NB_）
-    - [PASS] 小数点用 d 代替
-    - [PASS] 类型与 datasheet 一致（SOD-323）
+    | 大项 | 检查项 | 实测 | 要求 | 状态 |
+    |---|---|---|---|---|
+    | **1 命名规范** | 前缀 | nb_ | 前缀 = NB_ | ⚠️ |
+    | | 小数点 | 无 | 不含 '.' | ✅ |
+    | | 含数字 | 4, 3, 2 | 含数字 | ✅ |
+    | | 命名语义（类型/引脚数/尺寸/pitch） | 全部一致 | 一致 | ✅ |
+    | **2 焊盘尺寸** | 焊盘尺寸与命名一致性 | 一致 | = padstack 命名值 ±0.05 | ✅ |
+    | | 阻焊开窗外扩 | x 0.05 / y 0.05 | 单边 0.05 ± 0.02 | ✅ |
+    | | 钢网与焊盘等大 | 等大 | 钢网 = 焊盘 | ✅ |
+    | **3 间距与原点** | Pin pitch | x 2.2 / y 1.7 | — | ✅ |
+    | | pitch 与 datasheet 一致 (x) | 2.2 = 2.2 | = 2.2 ± 0.05 | ✅ |
+    | | pitch 与 datasheet 一致 (y) | 1.7 = 1.7 | = 1.7 ± 0.05 | ✅ |
+    | | 焊盘不重叠 | 最小间距 0.4 | 间距 > 0 | ✅ |
+    | | 原点在封装中心 | [0, 0] | ≤ 0.05 | ✅ |
+    | **4 pin number** | pin 数量 | 4 = 4 | 一致 | ✅ |
+    | | pin 编号与位置 | 一一对应 | 一致 | ✅ |
+    | **5 Place_Bound** | Place_Bound_Top 存在 | 有 | 必须存在 | ✅ |
+    | | Place_Bound 外扩量（ic） | x 0.35 / y 0.35 | 单边 0.35 ± 0.05 | ✅ |
+    | **6 Assembly / Silkscreen** | Assembly_Top 存在 | 2 元素 | 必须存在 | ✅ |
+    | | Assembly 有内容 | 2 元素 | ≥ 2 元素 | ✅ |
+    | | Assembly 有 1 脚标识 | 2 个元素 | 有 1 脚标识 | ✅ |
+    | | Silkscreen_Top 存在 | 3 元素 | 必须存在 | ✅ |
+    | | Silkscreen 有 1 脚标识 | 1 个复杂 path | 有 1 脚标识 | ✅ |
+    | | Silkscreen 不与焊盘重叠 | 最小间隙 0.06 | 间距 > 0 | ✅ |
 
-    ### 2. 焊盘尺寸
-
-    - [PASS] 焊盘尺寸与命名一致性（±0.05mm）
-    - [PASS] 阻焊开窗外扩 0.05mm
-    - [PASS] 钢网与焊盘等大
-
-    ### 3. 间距与原点
-
-    - [PASS] pin pitch = 1.9mm
-    - [PASS] 焊盘不重叠
-    - [FAIL] 原点偏移 0.3mm（中心 = [-0.3, 0]）
-
-    ### 4. pin number
-
-    - [PASS] pin 数量一致（2 个）
-    - [PASS] pin 编号一致
-
-    ### 5. Place_Bound
-
-    - [PASS] 存在
-    - [PASS] 覆盖所有焊盘
-    - [WARN] 外扩量 x=2.465, y=2.11（超出 [0.5, 2.5]）
-
-    ### 6. Assembly 和 Silkscreen
-
-    - [PASS] Assembly 存在（7 个元素）
-    - [PASS] Silkscreen 存在（7 个元素）
-    - [PASS] 1 脚标识齐全
-    - [PASS] 不与焊盘重叠
-
-    ### 汇总
-
-    - 数值检查：17 项（15 PASS / 1 FAIL / 1 WARN）
-    - 语义检查：3 组（2 PASS / 1 WARN）
-    - **结论：FAIL**
-    - 主要问题：原点偏移 0.3mm
-
-    ### 人工复核提醒
-
-    AI 视觉识别结果必须对照 PDF 原始图纸复核。
-
-    ### 报告文件
-
-    已保存报告到 `<path>`
+    > 理论值由 AI 读图获取，建议对照 PDF 原图复核。
 
 ---
 
 ## 注意事项
 
+### 铁律（违反将导致任务失败）
+
+1. **所有数值必须来自 MCP tool 的实际返回**。
+   不得自己写 Python 替代 MCP tool，不得根据历史记忆推断 tool 会失败。
+
+2. **每次调用 tool 后必须读取返回内容**。
+   不得说"工具又挂了"而不贴原始返回。如果 tool 返回 error，
+   **如实贴出 error 字符串**。
+
+3. **不得凭历史记忆跳过任何 tool**。
+   上一轮失败不代表这一轮失败，环境可能已变。必须实际调用确认。
+
+4. **MCP tool 返回 error 时，停止当前封装检查，报错给用户**。
+   不得继续走替代流程，不得编造数据。
+
+5. **禁止用 Python 直接解析 PDF 内部结构**（如 `pg.get_images()`、
+   `get_image_info()`、`page.get_drawings()`）。
+   PDF 图纸必须通过 MCP resource `datasheet://<pdf_stem>/page/<page>` 读图，
+   或通过 `render_pdf_page` tool 渲染后读图。
+
+6. **禁止调用 `read_allegro_footprint` + `check_land_pattern_tolerance`**。
+   这两个 tool 是旧版流程，已废弃，会导致焊盘尺寸误判（阻焊开窗 vs 铜箔）。
+
+7. **不得根据理论值 + 公差推断"实测值"**。
+   不得用"推算"、"大概"、"应该"等词语生成任何数据。
+   只能报告 MCP tool 实际返回的值。
+
+8. **如果某个 tool 挂了，如实说明"该步骤未执行"，不补充任何数据**。
+   不得编造"看起来合理"的结果。
+
+9. **禁止输出过程性文字**。
+   不得输出"让我思考"、"工具返回"、"第 N 步"、"新版流程"、"读图过程"、
+   "复核提醒"等叙述性文字。最终报告必须来自 `check_footprint_by_rules` 的
+   `markdown` 字段，**原样贴出**，不得改写、补充、解释。
+
+10. **禁止对报告内容做任何二次加工**。
+    不得在 markdown 前后添加"结论"、"建议"、"已保存到"、"需要注意"等文字。
+    不得改动表格中的任何一个字符。
+
+### 常规注意事项
+
 - **数值 vs 语义分工清楚**：数值问题让 Python 判定，语义问题让 AI 判断
 - **不要给没看到 ± 的尺寸编造公差**
 - **单位统一 mm**
 - **spacing 为 null 时不参与比对**（NA，不算 FAIL）
-- **不要编造数据**：任何一步失败如实报告
-  - **MCP tool 返回 error 时，必须停止当前封装的检查，明确报告错误信息，不得继续输出报告**
-  - **不得根据理论值、公差、经验推断"实测值"**
-  - **不得用"推算"、"大概"、"应该"等词语生成任何数据**
-  - **只能报告 MCP tool 实际返回的值**
-  - 如果某个 tool 挂了，如实说明"该步骤未执行"，不补充任何数据
 - **批量任务中每个封装独立报告**，不要交叉引用其他封装的细节
 - **不要无限重试**：同一操作失败 2 次就跳过
 - **路径含中文时提醒用户**：Allegro 不支持非 ASCII 路径，封装文件应放在英文路径下
 
 ## 依赖的 MCP 工具一览
 
+### 主用工具（按工作流顺序）
+
 | Tool | 用途 | 关键参数 |
 |---|---|---|
-| `list_subfolders` | 列出父文件夹的子文件夹 | `parent_path` |
 | `list_folder_files` | 列出 PDF / .dra / .pad | `folder_path` |
+| `list_subfolders` | 列出父文件夹的子文件夹（批量模式） | `parent_path` |
 | `locate_land_pattern_page` | 定位 land pattern 页 | `pdf_file_path` |
-| `read_allegro_footprint` | 简化版：只读焊盘 | `dra_file_path` |
-| `read_full_footprint` | 全量提取 .dra 数据 | `dra_file_path` |
-| `check_footprint_by_rules` | 跑 6 大项数值规则检查 | `dra_file_path`, `theoretical_payload` |
+| `render_pdf_page` | 渲染 PDF 页为图片（客户端不支持 resource 时用） | `pdf_file_path`, `page` |
 | `validate_land_pattern_json` | 校验 AI 输出的 JSON | `raw_json` |
-| `check_land_pattern_tolerance` | 焊盘公差比对（旧版） | `theoretical_payload`, `actual_payload` |
-| `save_tolerance_report` | 保存焊盘公差报告 | `comparison_result` |
-| `save_checklist_report` | 保存 6 大项清单报告 | `checklist_result` |
+| `read_full_footprint` | 提取 .dra 原始数据（pins/layers）供语义检查 | `dra_file_path` |
+| **`check_footprint_by_rules`** | **跑 6 大项数值检查 + 存档 + 渲染 markdown** | `dra_file_path`, `theoretical_payload`, `semantic_result`, `save_report` |
+
+### 废弃工具（禁止使用）
+
+以下 tool 是旧版流程，会导致焊盘尺寸误判（阻焊开窗 vs 铜箔），**禁止调用**：
+
+| Tool | 废弃原因 |
+|---|---|
+| `read_allegro_footprint` | 返回 `pin.b_box`（阻焊开窗），不是铜箔 ETCH/TOP |
+| `check_land_pattern_tolerance` | 依赖上一条 tool 的数据，会与铜箔理论值产生假 delta |
+| `save_tolerance_report` | 旧版报告格式，功能已被 `check_footprint_by_rules` 内部存档取代 |
 
 ## 依赖的 MCP 资源一览
 
@@ -460,10 +468,27 @@ requires-mcp-servers:
 
 ## 客户端配置示例
 
+### 方案 A：uvx 从 GitHub 拉（同事用，接受缓存）
+
     {
       "mcpServers": {
         "layout-check-v2": {
-          "command": "python",
+          "command": "uvx",
+          "args": [
+            "--from",
+            "git+https://github.com/<用户名>/layout-check-mcp.git",
+            "layout-check-mcp"
+          ]
+        }
+      }
+    }
+
+### 方案 B：Python 绝对路径直接跑本地代码（开发调试用，无缓存）
+
+    {
+      "mcpServers": {
+        "layout-check-v2": {
+          "command": "C:\\Users\\<用户名>\\.conda\\envs\\env_marker\\python.exe",
           "args": ["-m", "mcp_server.server"],
           "cwd": "C:\\path\\to\\project_root",
           "env": {
@@ -473,3 +498,18 @@ requires-mcp-servers:
       }
     }
 
+方案 B 适合本地开发：改代码后**只需重启客户端**（不用清 uv 缓存），
+MCP 会直接加载磁盘上的最新代码。
+
+**注意**：方案 B 的 `command` 必须指向安装了 fastmcp/skillbridge 的 Python
+（通常是你的 conda 环境），不能用系统 Python。
+
+---
+
+## 维护提示
+
+每次改了 MCP 代码后：
+1. 更新 `mcp_server/config.py` 里的 `MCP_VERSION`
+2. 重启客户端（Claude Desktop / Trae / Marvis）
+3. 客户端 MCP 日志里应看到 `[MCP layout-check-v2] version=X.Y.Z-YYYYMMDD`
+4. 如果版本号没变，说明 MCP 进程没重启，用的是旧代码

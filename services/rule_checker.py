@@ -1,13 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-rule_checker.py —— 基于 Excel 规范的数值规则检查 (v6)
+rule_checker.py —— 基于 Excel 规范的数值规则检查 (v8)
 
-v6 修复：
-  - 加元件类型识别 _classify_component（从名字判断 IC / chip / connector）
-  - 3.3 最小间距：改成"bbox 真实几何重叠检测"
-    （HDMI 等连接器上下两排 pin 交错是正常设计，欧氏距离可能很小但不重叠）
-  - 5.2 外扩量：按元件类型应用不同规则（IC 0.35 / chip 0.15 / connector 0.85）
-  - 3.4 原点：连接器放宽容差（可从 pin 1 或结构基准为原点）
+v8 改动（本次）：
+  - `_item()` 新增两个字段：
+      · expected : 结构化"要求"值（字符串或 None），供报告渲染层直接搬运，
+                   不再需要 AI 从自由文本 rule 里猜。
+      · source   : 判据来源，取值：
+                     "default"   —— 来自 DEFAULT_RULES（Excel 设计规范）
+                     "datasheet" —— 来自传入的 theoretical_payload（规格书理论值）
+                     "self"      —— 内部一致性（同一文件内 A 处 vs B 处）
+                     None        —— NA 项或纯测量项，无判据
+  - **判定逻辑、阈值、status 计算全部未变**，只附加字段。
+    跑同一批 .dra，改动前后每项 status 必须逐项一致。
+
+v7 修复（保留）：
+  - 5.2 Place_Bound 外扩量：reference 改用 Assembly 器件本体外框
+  - 5.2a：place_bound 必须覆盖所有 pin 的 bbox
+  - 5.2b：外扩量相对 Assembly 层"器件外框"计算
+
+v6 已含（保留）：
+  - 元件类型识别 _classify_component
+  - 3.3 焊盘不重叠（bbox 真实几何重叠）
+  - 5.2 / 3.4 按元件类型应用不同规则
 """
 from __future__ import annotations
 
@@ -54,7 +69,6 @@ DEFAULT_RULES: Dict[str, Any] = {
 # ============================================================
 # 元件类型识别
 # ============================================================
-# 名字里的关键词 → 类型
 CONNECTOR_KEYWORDS = [
     "con", "conn", "connector", "hdmi", "usb", "typec", "type-c",
     "fpc", "btb", "wtb", "dsub", "rj45", "sata", "sd", "tf",
@@ -91,9 +105,8 @@ def _classify_component(name: str) -> str:
             return "ic"
     # 最后匹配 chip
     for kw in CHIP_KEYWORDS:
-        # 短关键词做单词边界检查（避免 "r" 出现在 "resistor" 里被误判）
+        # 短关键词做单词边界检查
         if len(kw) <= 2:
-            # 检查是否作为独立 token（用 _ 或数字分隔）
             if re.search(rf"(^|_){re.escape(kw)}($|_)", low):
                 return "chip"
         else:
@@ -211,10 +224,68 @@ def _bbox_contains(outer, inner) -> bool:
     )
 
 
+def _find_largest_bbox_element(elements: List[Dict]) -> Optional[Dict]:
+    """找 bbox 面积最大的元素"""
+    if not elements:
+        return None
+    best = None
+    best_area = 0.0
+    for el in elements:
+        area = _bbox_area(el.get("bbox"))
+        if area > best_area:
+            best_area = area
+            best = el
+    return best
+
+
+def _find_device_outline(assembly_elements: List[Dict]) -> Optional[Dict]:
+    """
+    从 Assembly 层元素里找"器件本体外框"。
+
+    判定标准：
+      1. 优先找 n_segs == 4 的元素（闭合矩形）
+      2. 在符合条件的元素里取 bbox 面积最大的
+      3. 如果没有任何 n_segs == 4 的元素，退化为找面积最大的
+
+    为什么这么判：
+      - 器件外框通常是用矩形（4 段 path）画的
+      - Assembly 层还有 1 脚标识、极性字符等小元素，面积远小于外框
+      - 用"n_segs == 4 + 面积最大"双条件比"绝对面积阈值"更稳
+        （SOD-323 之类的小器件面积小，用阈值会误判）
+    """
+    if not assembly_elements:
+        return None
+
+    # 优先找 4 段矩形
+    rects = [e for e in assembly_elements if e.get("n_segs") == 4]
+    if rects:
+        return max(rects, key=lambda e: _bbox_area(e.get("bbox")))
+
+    # 退化为面积最大
+    return _find_largest_bbox_element(assembly_elements)
+
+
 # ============================================================
 # 结果构造
 # ============================================================
-def _item(id_: str, name: str, status: str, value=None, rule=None, detail="") -> Dict:
+def _item(
+    id_: str,
+    name: str,
+    status: str,
+    value=None,
+    rule=None,
+    detail="",
+    expected=None,
+    source=None,
+) -> Dict:
+    """
+    构造一个检查项。
+
+    :param expected: 结构化"要求"值（字符串或 None）。
+                     报告渲染层直接搬运到"要求"列，AI 不再从 rule 自由文本猜。
+    :param source:   判据来源，取值 "default" | "datasheet" | "self" | None。
+                     NA 项或纯测量项填 None。
+    """
     return {
         "id": id_,
         "name": name,
@@ -222,6 +293,8 @@ def _item(id_: str, name: str, status: str, value=None, rule=None, detail="") ->
         "value": value,
         "rule": rule,
         "detail": detail,
+        "expected": expected,
+        "source": source,
     }
 
 
@@ -262,6 +335,8 @@ def check_naming(data: Dict, rules: Dict) -> List[Dict]:
         value=name,
         rule=f"以 {prefix} 开头",
         detail=detail,
+        expected=f"前缀 = {prefix}",
+        source="default",
     ))
 
     if cfg.get("no_dot", True):
@@ -272,6 +347,8 @@ def check_naming(data: Dict, rules: Dict) -> List[Dict]:
             value=name,
             rule="名字中不能出现 '.'",
             detail="发现小数点，规范要求用字母 d 代替" if has_dot else "",
+            expected="不含 '.'",
+            source="default",
         ))
 
     nums = re.findall(r"\d+", name)
@@ -281,6 +358,8 @@ def check_naming(data: Dict, rules: Dict) -> List[Dict]:
         value=nums[:3],
         rule="名字中应含数字（引脚数/尺寸）",
         detail="" if nums else "未从名字中提取到任何数字",
+        expected="含数字",
+        source="default",
     ))
 
     return items
@@ -312,7 +391,11 @@ def check_pad_size(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List
 
     pins = data.get("pins", [])
     if not pins:
-        return [_item("2.1", "焊盘尺寸", "NA", detail="无 pin 数据")]
+        return [_item(
+            "2.1", "焊盘尺寸", "NA",
+            detail="无 pin 数据",
+            expected=None, source=None,
+        )]
 
     all_match = True
     mismatch_detail = []
@@ -342,6 +425,8 @@ def check_pad_size(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List
         value=f"容差 ±{tol}mm",
         rule="焊盘实际尺寸必须与 padstack 命名匹配",
         detail=" | ".join(mismatch_detail[:3]),
+        expected=f"= padstack 命名值 ±{tol}",
+        source="self",
     ))
 
     sm_expand_rule = cfg.get("soldermask_expand_mm", 0.05)
@@ -369,9 +454,15 @@ def check_pad_size(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List
             value={"单边x": _round(sample_ex), "单边y": _round(sample_ey)},
             rule=f"单边外扩 {sm_expand_rule}mm（±0.02）",
             detail="",
+            expected=f"单边 {sm_expand_rule} ± 0.02",
+            source="default",
         ))
     else:
-        items.append(_item("2.2", "阻焊开窗外扩", "NA", detail="无 SOLDERMASK_TOP 数据"))
+        items.append(_item(
+            "2.2", "阻焊开窗外扩", "NA",
+            detail="无 SOLDERMASK_TOP 数据",
+            expected=None, source=None,
+        ))
 
     if cfg.get("pastemask_equal_pad", True):
         pt_ok = True
@@ -394,9 +485,15 @@ def check_pad_size(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List
             value="等大" if pt_ok else "不等大",
             rule="Chip 元件钢网开窗与焊盘等大",
             detail=" | ".join(pt_detail[:3]),
+            expected="钢网 = 焊盘",
+            source="self",
         ))
     else:
-        items.append(_item("2.3", "钢网与焊盘等大", "NA", detail="规则关闭"))
+        items.append(_item(
+            "2.3", "钢网与焊盘等大", "NA",
+            detail="规则关闭",
+            expected=None, source=None,
+        ))
 
     return items
 
@@ -408,7 +505,11 @@ def check_pitch(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List[Di
     items = []
     pins = data.get("pins", [])
     if len(pins) < 2:
-        return [_item("3.1", "Pin pitch", "NA", detail="pin 数不足")]
+        return [_item(
+            "3.1", "Pin pitch", "NA",
+            detail="pin 数不足",
+            expected=None, source=None,
+        )]
 
     xs = sorted(set(round(p["xy"][0], 4) for p in pins if p.get("xy")))
     ys = sorted(set(round(p["xy"][1], 4) for p in pins if p.get("xy")))
@@ -421,12 +522,15 @@ def check_pitch(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List[Di
     pitch_x = min_gap(xs)
     pitch_y = min_gap(ys)
 
+    # 3.1 纯测量项：仅报告 pitch 值，无判据
     items.append(_item(
         "3.1", "Pin pitch",
         "PASS" if pitch_x or pitch_y else "NA",
         value={"pitch_x": pitch_x, "pitch_y": pitch_y},
         rule="相邻 pin 中心间距",
         detail="",
+        expected=None,
+        source=None,
     ))
 
     if theoretical:
@@ -441,6 +545,8 @@ def check_pitch(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List[Di
                 value={"extracted": pitch_x, "datasheet": theo_sx},
                 rule="差值 <= 0.05mm",
                 detail="" if ok_x else f"x 方向差值 {_round(abs(pitch_x - theo_sx))}mm",
+                expected=f"= {theo_sx} ± 0.05",
+                source="datasheet",
             ))
         if theo_sy is not None and pitch_y is not None:
             ok_y = abs(pitch_y - theo_sy) <= 0.05
@@ -450,10 +556,11 @@ def check_pitch(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List[Di
                 value={"extracted": pitch_y, "datasheet": theo_sy},
                 rule="差值 <= 0.05mm",
                 detail="" if ok_y else f"y 方向差值 {_round(abs(pitch_y - theo_sy))}mm",
+                expected=f"= {theo_sy} ± 0.05",
+                source="datasheet",
             ))
 
-    # 3.3 最小间距：用"几何重叠"检测，而不是"距离阈值"
-    # 只有两个焊盘 bbox 真实重叠才算 FAIL
+    # 3.3 焊盘不重叠：真实几何重叠检测
     overlap_found = False
     overlap_detail = ""
     min_clearance = float("inf")
@@ -465,8 +572,6 @@ def check_pitch(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List[Di
             b2 = pins[j].get("bbox")
             if not b1 or not b2:
                 continue
-
-            # 用真实重叠面积判定
             area = _bbox_overlap_area(b1, b2)
             if area > 0:
                 overlap_found = True
@@ -475,8 +580,6 @@ def check_pitch(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List[Di
                     f"{_round(area)}mm²"
                 )
                 break
-
-            # 记录最小间距供参考
             d = _bbox_min_distance(b1, b2)
             if d < min_clearance:
                 min_clearance = d
@@ -491,6 +594,8 @@ def check_pitch(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List[Di
             value="重叠",
             rule="任意两个焊盘 bbox 不能几何重叠",
             detail=overlap_detail,
+            expected="间距 > 0",
+            source="self",
         ))
     else:
         detail = ""
@@ -505,6 +610,8 @@ def check_pitch(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List[Di
             value=_round(min_clearance) if min_clearance != float("inf") else None,
             rule="任意两个焊盘 bbox 不能几何重叠",
             detail=detail,
+            expected="间距 > 0",
+            source="self",
         ))
 
     # 3.4 原点居中（按元件类型区分容差）
@@ -516,18 +623,18 @@ def check_pitch(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List[Di
         origin_tol = origin_cfg.get("center_tolerance_mm", 0.05)
 
     center = None
-    source = None
+    source_center = None
 
     pb = data.get("layers", {}).get("place_bound_top") or []
     if pb and pb[0].get("bbox"):
         center = pb[0]["center"]
-        source = "place_bound_top"
+        source_center = "place_bound_top"
 
     if center is None:
         pins_bbox = _pins_combined_bbox(pins)
         if pins_bbox:
             center = _bbox_center(pins_bbox)
-            source = "pins_combined"
+            source_center = "pins_combined"
 
     if center is not None:
         offset = math.hypot(center[0], center[1])
@@ -542,7 +649,7 @@ def check_pitch(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List[Di
             status,
             value={
                 "center": [_round(center[0]), _round(center[1])],
-                "source": source,
+                "source": source_center,
                 "component_type": comp_type,
             },
             rule=f"{comp_type} 类容差 <= {origin_tol}mm",
@@ -550,9 +657,15 @@ def check_pitch(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List[Di
                 f"中心偏移 {_round(offset)}mm"
                 + ("（连接器允许以 pin 1 或结构基准为原点）" if comp_type == "connector" else "")
             ),
+            expected=f"≤ {origin_tol}",
+            source="default",
         ))
     else:
-        items.append(_item("3.4", "原点在封装中心", "NA", detail="无数据"))
+        items.append(_item(
+            "3.4", "原点在封装中心", "NA",
+            detail="无数据",
+            expected=None, source=None,
+        ))
 
     return items
 
@@ -565,14 +678,18 @@ def check_place_bound(data: Dict, rules: Dict) -> List[Dict]:
     cfg = rules.get("place_bound", {})
     layers = data.get("layers", {})
     pins = data.get("pins", [])
+    asm = layers.get("assembly_top") or []
     pb = layers.get("place_bound_top") or []
 
+    # ---------- 5.1 存在性 ----------
     items.append(_item(
         "5.1", "Place_Bound_Top 存在",
         "PASS" if pb else "FAIL",
         value=len(pb),
         rule="必须画 Place_Bound_Top",
         detail="" if pb else "未找到 Place_Bound_Top 层",
+        expected="必须存在",
+        source="default",
     ))
 
     if not pb:
@@ -585,14 +702,14 @@ def check_place_bound(data: Dict, rules: Dict) -> List[Dict]:
         items.append(_item(
             "5.2", "Place_Bound 外扩量",
             "NA", detail="缺 place_bound 或 pins 数据",
+            expected=None, source=None,
         ))
         return items
 
-    pb_size = _bbox_size(pb_bbox)
-    pins_size = _bbox_size(pins_bbox)
+    # ---------- 5.2a 覆盖检查（相对 pins bbox） ----------
+    # 这个用 pins bbox 是对的：place_bound 必须覆盖所有焊盘
     contains = _bbox_contains(pb_bbox, pins_bbox)
 
-    # 先检查覆盖
     if not contains:
         issues = []
         if pb_bbox[1][0] < pins_bbox[1][0]:
@@ -602,7 +719,7 @@ def check_place_bound(data: Dict, rules: Dict) -> List[Dict]:
         if pb_bbox[1][1] < pins_bbox[1][1]:
             issues.append(f"上方缺 {_round(pins_bbox[1][1] - pb_bbox[1][1])}mm")
         if pb_bbox[0][1] > pins_bbox[0][1]:
-            issues.append(f"下方缺 {_round(pb_bbox[0][1] - pins_bbox[0][1])}mm")
+            issues.append(f"下方缺 {_round(pins_bbox[0][1] - pb_bbox[0][1])}mm")
 
         items.append(_item(
             "5.2", "Place_Bound 覆盖焊盘",
@@ -613,35 +730,66 @@ def check_place_bound(data: Dict, rules: Dict) -> List[Dict]:
             },
             rule="Place_Bound bbox 必须完全覆盖所有 pin 的 bbox",
             detail="Place_Bound 未覆盖焊盘：" + "，".join(issues),
+            expected="覆盖所有焊盘",
+            source="self",
         ))
         return items
 
-    # 已覆盖，按元件类型计算外扩量
-    expand_x = (pb_size[0] - pins_size[0]) / 2
-    expand_y = (pb_size[1] - pins_size[1]) / 2
+    # ---------- 5.2b 外扩量（相对 Assembly 器件本体） ----------
+    # 规范的"外扩 0.35mm"是相对器件本体算的，不是相对 pins bbox
+    device_outline = _find_device_outline(asm)
 
+    if device_outline is None:
+        items.append(_item(
+            "5.2", "Place_Bound 外扩量",
+            "NA",
+            detail="Assembly 层没有可识别的器件外框（n_segs == 4 的矩形），无法计算外扩量",
+            expected=None, source=None,
+        ))
+        return items
+
+    device_bbox = device_outline.get("bbox")
+    device_size = _bbox_size(device_bbox)
+    pb_size = _bbox_size(pb_bbox)
+
+    if not device_size or not pb_size:
+        items.append(_item(
+            "5.2", "Place_Bound 外扩量",
+            "NA", detail="器件外框或 place_bound 尺寸异常",
+            expected=None, source=None,
+        ))
+        return items
+
+    expand_x = (pb_size[0] - device_size[0]) / 2
+    expand_y = (pb_size[1] - device_size[1]) / 2
+
+    # 按元件类型选规则
     comp_type = _classify_component(data.get("symbol_name", ""))
     ic_tol = cfg.get("expand_tolerance_mm", 0.05)
 
     if comp_type == "ic":
-        expected = cfg.get("ic_expand_mm", 0.35)
-        ok = abs(expand_x - expected) <= ic_tol and abs(expand_y - expected) <= ic_tol
-        rule_str = f"IC 类：单边外扩 {expected}mm ±{ic_tol}"
+        expected_val = cfg.get("ic_expand_mm", 0.35)
+        ok = abs(expand_x - expected_val) <= ic_tol and abs(expand_y - expected_val) <= ic_tol
+        rule_str = f"IC 类：相对器件本体单边外扩 {expected_val}mm ±{ic_tol}"
+        expected_str = f"单边 {expected_val} ± {ic_tol}"
     elif comp_type == "chip":
-        expected = cfg.get("chip_expand_mm", 0.15)
-        ok = abs(expand_x - expected) <= ic_tol and abs(expand_y - expected) <= ic_tol
-        rule_str = f"Chip 类：单边外扩 {expected}mm ±{ic_tol}"
+        expected_val = cfg.get("chip_expand_mm", 0.15)
+        ok = abs(expand_x - expected_val) <= ic_tol and abs(expand_y - expected_val) <= ic_tol
+        rule_str = f"Chip 类：相对器件本体单边外扩 {expected_val}mm ±{ic_tol}"
+        expected_str = f"单边 {expected_val} ± {ic_tol}"
     elif comp_type == "connector":
-        expected = cfg.get("connector_expand_mm", 0.85)
-        # 连接器放宽：允许 [0.5, 2.5]
+        expected_val = cfg.get("connector_expand_mm", 0.85)
         ok = 0.5 <= expand_x <= 2.5 and 0.5 <= expand_y <= 2.5
-        rule_str = f"连接器：单边外扩在 [0.5, 2.5]mm 之间（推荐 {expected}）"
+        rule_str = f"连接器：相对器件本体单边外扩 [0.5, 2.5]mm（推荐 {expected_val}）"
+        expected_str = "单边 [0.5, 2.5]"
     else:
-        # 未知类型，用宽松范围
         min_e = cfg.get("min_expand_mm", 0.05)
         max_e = cfg.get("max_expand_mm", 3.0)
         ok = min_e <= expand_x <= max_e and min_e <= expand_y <= max_e
-        rule_str = f"未知类型，外扩量在 [{min_e}, {max_e}]mm"
+        rule_str = f"未知类型：外扩量在 [{min_e}, {max_e}]mm"
+        expected_str = f"单边 [{min_e}, {max_e}]"
+
+    pins_size = _bbox_size(pins_bbox)
 
     items.append(_item(
         "5.2", f"Place_Bound 外扩量（{comp_type}）",
@@ -650,12 +798,16 @@ def check_place_bound(data: Dict, rules: Dict) -> List[Dict]:
             "expand_x": _round(expand_x),
             "expand_y": _round(expand_y),
             "pb_size": [_round(pb_size[0]), _round(pb_size[1])],
-            "pins_size": [_round(pins_size[0]), _round(pins_size[1])],
+            "device_size": [_round(device_size[0]), _round(device_size[1])],
+            "pins_size": [_round(pins_size[0]), _round(pins_size[1])] if pins_size else None,
+            "reference": "assembly_device_outline",
         },
         rule=rule_str,
         detail="" if ok else (
             f"expand_x={_round(expand_x)}, expand_y={_round(expand_y)}"
         ),
+        expected=expected_str,
+        source="default",
     ))
 
     return items
@@ -674,6 +826,8 @@ def check_assembly(data: Dict, rules: Dict) -> List[Dict]:
         value=len(asm),
         rule="必须画 Assembly_Top",
         detail="" if asm else "未找到 Assembly_Top 层",
+        expected="必须存在",
+        source="default",
     ))
 
     if not asm:
@@ -692,6 +846,8 @@ def check_assembly(data: Dict, rules: Dict) -> List[Dict]:
         },
         rule="Assembly 层应有至少 2 个元素（外框 + 标识）",
         detail="" if has_content else "元素过少",
+        expected="≥ 2 元素",
+        source="default",
     ))
 
     has_pin1 = len(asm) >= 2
@@ -701,6 +857,8 @@ def check_assembly(data: Dict, rules: Dict) -> List[Dict]:
         value=f"{len(asm)} 个元素",
         rule="Assembly 层应有 1 脚标识",
         detail="" if has_pin1 else "只有 1 个元素",
+        expected="有 1 脚标识",
+        source="default",
     ))
 
     return items
@@ -720,6 +878,8 @@ def check_silkscreen(data: Dict, rules: Dict) -> List[Dict]:
         value=len(silk),
         rule="必须画 Silkscreen_Top",
         detail="" if silk else "未找到 Silkscreen_Top 层",
+        expected="必须存在",
+        source="default",
     ))
 
     if not silk:
@@ -733,6 +893,8 @@ def check_silkscreen(data: Dict, rules: Dict) -> List[Dict]:
         value=f"{len(complex_paths)} 个复杂 path",
         rule="Silkscreen 层应有 1 脚标识",
         detail="" if has_pin1_marker else "未找到 1 脚标识",
+        expected="有 1 脚标识",
+        source="default",
     ))
 
     overlap_found = False
@@ -765,6 +927,8 @@ def check_silkscreen(data: Dict, rules: Dict) -> List[Dict]:
             value="重叠",
             rule="Silkscreen 线段端点不能落在焊盘区域内",
             detail=overlap_detail,
+            expected="间距 > 0",
+            source="self",
         ))
     else:
         clearance_str = ""
@@ -776,6 +940,8 @@ def check_silkscreen(data: Dict, rules: Dict) -> List[Dict]:
             value=_round(min_clearance) if min_clearance != float("inf") else None,
             rule="Silkscreen 线段端点不能落在焊盘区域内",
             detail=clearance_str,
+            expected="间距 > 0",
+            source="self",
         ))
 
     return items
@@ -796,7 +962,11 @@ def run_numeric_checks(
         return {
             "conclusion": "FAIL",
             "summary": {"total": 1, "pass": 0, "fail": 1, "warn": 0, "na": 0},
-            "items": [_item("0", "数据提取", "FAIL", detail=footprint_data["error"])],
+            "items": [_item(
+                "0", "数据提取", "FAIL",
+                detail=footprint_data["error"],
+                expected=None, source=None,
+            )],
             "failed": [],
             "warned": [],
         }
