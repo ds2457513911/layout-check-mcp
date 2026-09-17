@@ -1,156 +1,156 @@
 @echo off
 chcp 65001 >nul
 setlocal EnableDelayedExpansion
-title layout-check-mcp 一键部署
+title layout-check-mcp deploy
 
 REM ============================================================
-REM  deploy.bat —— layout-check-mcp 独立部署引导器
+REM  deploy.bat -- layout-check-mcp standalone deployer
 REM
-REM  本脚本是"自包含"的：同事只需要这一个文件。
-REM  双击运行后会自动：
-REM    1) 检查 / 安装 uv
-REM    2) 检查 / 安装 git
-REM    3) 从 GitHub clone 项目到本脚本所在目录
-REM    4) uv sync 预装依赖
-REM    5) 运行 Tools\install_skillbridge.py
-REM    6) 输出 MCP 配置 + SKILL.md 路径
+REM  This script is self-contained: colleague needs only this file.
+REM  On double-click it will:
+REM    1) Check / install uv
+REM    2) Check / install git
+REM    3) Clone the project from GitHub into this script's directory
+REM    4) uv sync (install dependencies)
+REM    5) Run Tools\install_skillbridge.py
+REM    6) Print MCP config + SKILL.md path
 REM
-REM  保存要求：UTF-8 with BOM（不是 UTF-8 无 BOM）
+REM  Save requirement: ASCII or UTF-8 (no BOM), English-only prompts.
 REM ============================================================
 
-REM ---- 脚本所在目录（去掉末尾反斜杠）----
+REM ---- Script directory (strip trailing backslash) ----
 set "SCRIPT_DIR=%~dp0"
 if "%SCRIPT_DIR:~-1%"=="\" set "SCRIPT_DIR=%SCRIPT_DIR:~0,-1%"
 
-REM ---- GitHub 仓库信息 ----
+REM ---- GitHub repo info ----
 set "REPO_URL=https://github.com/ds2457513911/layout-check-mcp.git"
 set "REPO_NAME=layout-check-mcp"
 set "PROJECT_ROOT=%SCRIPT_DIR%\%REPO_NAME%"
 
 echo.
 echo ============================================================
-echo  layout-check-mcp 一键部署
+echo  layout-check-mcp deployer
 echo ============================================================
-echo   工作目录: %SCRIPT_DIR%
-echo   项目目录: %PROJECT_ROOT%
+echo   Work dir : %SCRIPT_DIR%
+echo   Project  : %PROJECT_ROOT%
 echo.
 
 call :RefreshPath
 
-REM ---- 检查 winget ----
+REM ---- Check winget ----
 where winget >nul 2>&1
 if errorlevel 1 (
-    echo   [X] 未检测到 winget
-    echo       请从 Microsoft Store 安装 App Installer 后重试
+    echo   [X] winget not found.
+    echo       Install "App Installer" from Microsoft Store and retry.
     goto :fail
 )
 
-REM ============ 步骤 1：uv ============
+REM ============ Step 1: uv ============
 echo.
-echo [1/6] 检查 uv
+echo [1/6] Check uv
 call :FindUv
 if not defined UV (
-    echo       未检测到 uv，使用 winget 安装...
+    echo       uv not found, installing via winget...
     winget install astral-sh.uv --accept-source-agreements --accept-package-agreements
     call :RefreshPath
     call :FindUv
 )
 if not defined UV (
-    echo   [X] uv 安装失败，请手动：winget install astral-sh.uv
+    echo   [X] uv install failed. Run manually: winget install astral-sh.uv
     goto :fail
 )
 echo   [OK] uv: !UV!
 
-REM ============ 步骤 2：git ============
+REM ============ Step 2: git ============
 echo.
-echo [2/6] 检查 git
+echo [2/6] Check git
 where git >nul 2>&1
 if errorlevel 1 (
-    echo       未检测到 git，使用 winget 安装（含 Unix 工具集）...
+    echo       git not found, installing via winget...
     winget install --id Git.Git -e --source winget --custom "/o:PathOption=CmdTools" --accept-source-agreements --accept-package-agreements
     call :RefreshPath
 )
 where git >nul 2>&1
 if errorlevel 1 (
-    echo   [X] git 安装失败
+    echo   [X] git install failed.
     goto :fail
 )
-echo   [OK] git 已安装
+echo   [OK] git ready
 
-REM ============ 步骤 3：clone / pull ============
+REM ============ Step 3: clone / pull ============
 echo.
-echo [3/6] 下载 / 更新项目
+echo [3/6] Fetch project
 
 if exist "%PROJECT_ROOT%" (
     if exist "%PROJECT_ROOT%\.git" (
-        echo       项目已存在，执行 git pull 更新...
+        echo       Project exists, running git pull...
         pushd "%PROJECT_ROOT%"
         git pull
         if errorlevel 1 (
             popd
-            echo   [X] git pull 失败
-            echo       可能原因：本地有改动、网络问题、或需要代理
+            echo   [X] git pull failed.
+            echo       Possible: local changes, network issue, or proxy needed.
             goto :fail
         )
         popd
-        echo   [OK] 项目已更新
+        echo   [OK] project updated
     ) else (
-        echo   [X] 目录 %PROJECT_ROOT% 已存在但不是 git 仓库
-        echo       请手动删除该目录后重试
+        echo   [X] %PROJECT_ROOT% exists but is not a git repo.
+        echo       Delete that folder and retry.
         goto :fail
     )
 ) else (
-    echo       从 GitHub 克隆（首次可能较慢，请耐心等待）...
+    echo       Cloning from GitHub (first time may take a while)...
     git clone "%REPO_URL%" "%PROJECT_ROOT%"
     if errorlevel 1 (
-        echo   [X] git clone 失败
-        echo       可能原因：
-        echo         - 网络无法访问 GitHub（需要代理）
-        echo         - 仓库地址变更
-        echo         - 磁盘权限问题
+        echo   [X] git clone failed.
+        echo       Possible reasons:
+        echo         - Cannot reach GitHub (proxy required)
+        echo         - Repo URL changed
+        echo         - Disk permission issue
         goto :fail
     )
-    echo   [OK] 项目已下载
+    echo   [OK] project downloaded
 )
 
-REM ---- 校验项目完整性 ----
+REM ---- Validate project ----
 if not exist "%PROJECT_ROOT%\pyproject.toml" (
-    echo   [X] %PROJECT_ROOT% 不是有效项目（缺 pyproject.toml）
+    echo   [X] %PROJECT_ROOT% is not a valid project (pyproject.toml missing)
     goto :fail
 )
 
-REM ============ 步骤 4：uv sync ============
+REM ============ Step 4: uv sync ============
 echo.
-echo [4/6] 预装 MCP 依赖
+echo [4/6] Install MCP dependencies
 pushd "%PROJECT_ROOT%"
 "!UV!" sync
 if errorlevel 1 (
     popd
-    echo   [X] uv sync 失败
+    echo   [X] uv sync failed.
     goto :fail
 )
 popd
-echo   [OK] 依赖安装完成
+echo   [OK] dependencies installed
 
-REM ============ 步骤 5：SkillBridge ============
+REM ============ Step 5: SkillBridge ============
 echo.
-echo [5/6] 配置 Allegro SkillBridge 自动加载
+echo [5/6] Configure Allegro SkillBridge auto-load
 if not exist "%PROJECT_ROOT%\Tools\install_skillbridge.py" (
-    echo   [X] 找不到 Tools\install_skillbridge.py
+    echo   [X] Tools\install_skillbridge.py not found.
     goto :fail
 )
 "!UV!" run "%PROJECT_ROOT%\Tools\install_skillbridge.py"
 if errorlevel 1 (
-    echo   [X] install_skillbridge.py 执行失败
+    echo   [X] install_skillbridge.py failed.
     goto :fail
 )
-echo   [OK] SkillBridge 配置完成
+echo   [OK] SkillBridge configured
 
-REM ============ 步骤 6：生成 MCP 配置 ============
+REM ============ Step 6: MCP config ============
 echo.
-echo [6/6] 生成 MCP 配置
+echo [6/6] Generate MCP config
 
-REM JSON 转义：反斜杠 \ 变 \\
+REM JSON escape: backslash \ -> \\
 set "UV_ESC=!UV:\=\\!"
 set "ROOT_ESC=!PROJECT_ROOT:\=\\!"
 set "MCP_FILE=%SCRIPT_DIR%\mcp-config.json"
@@ -166,7 +166,7 @@ echo   }
 echo }
 ) > "!MCP_FILE!"
 
-REM ---- 定位 SKILL.md（兼容 .trae/skills 与 skills 两种布局）----
+REM ---- Locate SKILL.md ----
 set "SKILL_DIR="
 if exist "%PROJECT_ROOT%\.trae\skills\footprint-tolerance-check\SKILL.md" (
     set "SKILL_DIR=%PROJECT_ROOT%\.trae\skills\footprint-tolerance-check"
@@ -176,32 +176,32 @@ if exist "%PROJECT_ROOT%\.trae\skills\footprint-tolerance-check\SKILL.md" (
 
 echo.
 echo ============================================================
-echo  部署完成
+echo  Deploy complete
 echo ============================================================
 echo.
-echo 【1】MCP 配置（已保存到 !MCP_FILE!）
+echo [1] MCP config (saved to !MCP_FILE!)
 echo.
 type "!MCP_FILE!"
 echo.
-echo 【2】SKILL.md 路径
+echo [2] SKILL.md path
 if defined SKILL_DIR (
     echo     !SKILL_DIR!
-    echo     把整个 footprint-tolerance-check 文件夹复制到 Agent 的 skills 目录
+    echo     Copy the footprint-tolerance-check folder into your Agent's skills dir.
 ) else (
-    echo     [未找到 SKILL.md，请检查项目结构]
+    echo     [SKILL.md not found - check project structure]
 )
 echo.
-echo 【3】下一步
-echo     1. 重启 Allegro PCB Editor
-echo     2. 验证端口: netstat -ano ^| findstr 7777
-echo     3. 重启 Agent 软件，确认 MCP 已连接
+echo [3] Next steps
+echo     1. Restart Allegro PCB Editor
+echo     2. Verify port: netstat -ano ^| findstr 7777
+echo     3. Restart your Agent app, confirm MCP is connected
 echo.
 pause
 exit /b 0
 
 
 REM ============================================================
-REM 子程序
+REM Subroutines
 REM ============================================================
 
 :FindUv
@@ -224,6 +224,6 @@ exit /b 0
 
 :fail
 echo.
-echo   部署失败，请检查上方错误信息
+echo   Deploy failed. Check the error above.
 pause
 exit /b 1
