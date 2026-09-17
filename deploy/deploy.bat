@@ -16,6 +16,8 @@ REM    5) Run Tools\install_skillbridge.py
 REM    6) Print MCP config + SKILL.md path
 REM
 REM  Save requirement: ASCII or UTF-8 (no BOM), English-only prompts.
+REM  NOTE: never put ( or ) inside "echo" lines that live inside an
+REM        "if (...)" block. CMD parses them as block delimiters.
 REM ============================================================
 
 REM ---- Script directory (strip trailing backslash) ----
@@ -100,12 +102,12 @@ if exist "%PROJECT_ROOT%" (
         goto :fail
     )
 ) else (
-    echo       Cloning from GitHub (first time may take a while)...
+    echo       Cloning from GitHub, first time may take a while...
     git clone "%REPO_URL%" "%PROJECT_ROOT%"
     if errorlevel 1 (
         echo   [X] git clone failed.
         echo       Possible reasons:
-        echo         - Cannot reach GitHub (proxy required)
+        echo         - Cannot reach GitHub - proxy may be required
         echo         - Repo URL changed
         echo         - Disk permission issue
         goto :fail
@@ -115,7 +117,7 @@ if exist "%PROJECT_ROOT%" (
 
 REM ---- Validate project ----
 if not exist "%PROJECT_ROOT%\pyproject.toml" (
-    echo   [X] %PROJECT_ROOT% is not a valid project (pyproject.toml missing)
+    echo   [X] %PROJECT_ROOT% is not a valid project - pyproject.toml missing
     goto :fail
 )
 
@@ -179,7 +181,7 @@ echo ============================================================
 echo  Deploy complete
 echo ============================================================
 echo.
-echo [1] MCP config (saved to !MCP_FILE!)
+echo [1] MCP config saved to: !MCP_FILE!
 echo.
 type "!MCP_FILE!"
 echo.
@@ -217,9 +219,14 @@ if not defined UV if exist "%LOCALAPPDATA%\Programs\uv\uv.exe" set "UV=%LOCALAPP
 exit /b 0
 
 :RefreshPath
-for /f "usebackq tokens=2,*" %%a in (`reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" /v Path 2^>nul`) do set "SysPath=%%b"
-for /f "usebackq tokens=2,*" %%a in (`reg query "HKCU\Environment" /v Path 2^>nul`) do set "UserPath=%%b"
-set "PATH=!SysPath!;!UserPath!"
+REM Non-destructive refresh: keep current session PATH, append common dirs.
+REM Never reset PATH from registry (REG_EXPAND_SZ has literal %VAR% strings
+REM that cmd does not expand on "set").
+set "PATH=%PATH%;%LOCALAPPDATA%\Microsoft\WindowsApps"
+set "PATH=%PATH%;%USERPROFILE%\.local\bin"
+set "PATH=%PATH%;%USERPROFILE%\.cargo\bin"
+set "PATH=%PATH%;%LOCALAPPDATA%\Programs\uv"
+set "PATH=%PATH%;C:\Program Files\Git\cmd"
 exit /b 0
 
 :fail
