@@ -43,15 +43,19 @@
 
 配置SKILL(直接选择整个footprint-tolerance-check文件夹)
 
-![截图](attachment:90d69606d6b6889aaf8d8bc075ccd28f)
+<img width="1438" height="850" alt="90d69606d6b6889aaf8d8bc075ccd28f" src="https://github.com/user-attachments/assets/0e1749af-42e5-4905-9e5e-354e9abddacb" />
 
-![截图](attachment:eeaea3ab185e746b1e7bdcdac6922637)
+
+<img width="1438" height="850" alt="eeaea3ab185e746b1e7bdcdac6922637" src="https://github.com/user-attachments/assets/d8a0b329-ab83-4f0d-b985-d9a4821cf08c" />
+
 
 配置 MCP
 
-![截图](attachment:c2f9bd6ea7bf90c1fbba365f32a9f541)
+<img width="1438" height="850" alt="c2f9bd6ea7bf90c1fbba365f32a9f541" src="https://github.com/user-attachments/assets/f5285caa-adea-4258-9f97-2de46472c082" />
 
-![截图](attachment:c7677966c08ae2b0acb13b4420662195)
+
+<img width="1438" height="850" alt="c7677966c08ae2b0acb13b4420662195" src="https://github.com/user-attachments/assets/a8242b1c-f705-4748-99c8-3997eb23636c" />
+
 
 ## 第三步：测试
 
