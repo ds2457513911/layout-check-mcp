@@ -4,20 +4,15 @@ setlocal EnableDelayedExpansion
 title layout-check-mcp deploy
 
 REM ============================================================
-REM  deploy.bat -- layout-check-mcp standalone deployer
+REM  deploy.bat -- layout-check-mcp standalone deployer  (v4)
 REM
-REM  This script is self-contained: colleague needs only this file.
-REM  On double-click it will:
-REM    1) Check / install uv
-REM    2) Check / install git
-REM    3) Clone the project from GitHub into this script's directory
-REM    4) uv sync (install dependencies)
-REM    5) Run Tools\install_skillbridge.py
-REM    6) Print MCP config + SKILL.md path
+REM  v4 变更（合并双环境为单环境）：
+REM    - 只在 <项目>\.venv 建一个环境，里面同时装 MCP 依赖和 skillbridge
+REM    - 不再创建 ~/.local/share/skillbridge_env
+REM    - deploy 时自动清理旧的 skillbridge_env
+REM    - allegro.ilinit 的 pythonw 路径改为指向 .venv\Scripts\pythonw.exe
 REM
 REM  Save requirement: ASCII or UTF-8 (no BOM), English-only prompts.
-REM  NOTE: never put ( or ) inside "echo" lines that live inside an
-REM        "if (...)" block. CMD parses them as block delimiters.
 REM ============================================================
 
 REM ---- Script directory (strip trailing backslash) ----
@@ -29,6 +24,11 @@ set "REPO_URL=https://github.com/ds2457513911/layout-check-mcp.git"
 set "REPO_NAME=layout-check-mcp"
 set "PROJECT_ROOT=%SCRIPT_DIR%\%REPO_NAME%"
 
+REM ---- Fixed paths ----
+set "LEGACY_ENV=%USERPROFILE%\.local\share\skillbridge_env"
+set "VENV_PYTHON=%PROJECT_ROOT%\.venv\Scripts\python.exe"
+set "VENV_PYTHONW=%PROJECT_ROOT%\.venv\Scripts\pythonw.exe"
+
 echo.
 echo ============================================================
 echo  layout-check-mcp deployer
@@ -38,6 +38,7 @@ echo   Project  : %PROJECT_ROOT%
 echo.
 
 call :RefreshPath
+call :CleanWingetLeftover
 
 REM ---- Check winget ----
 where winget >nul 2>&1
@@ -49,39 +50,47 @@ if errorlevel 1 (
 
 REM ============ Step 1: uv ============
 echo.
-echo [1/6] Check uv
+echo [1/7] Check uv
 call :FindUv
 if not defined UV (
     echo       uv not found, installing via winget...
-    winget install astral-sh.uv --accept-source-agreements --accept-package-agreements
+    call :InstallViaWinget astral-sh.uv
+    if errorlevel 1 (
+        echo   [X] uv install failed after retries.
+        goto :fail
+    )
     call :RefreshPath
     call :FindUv
 )
 if not defined UV (
-    echo   [X] uv install failed. Run manually: winget install astral-sh.uv
+    echo   [X] uv still not found after install.
     goto :fail
 )
 echo   [OK] uv: !UV!
 
 REM ============ Step 2: git ============
 echo.
-echo [2/6] Check git
+echo [2/7] Check git
 where git >nul 2>&1
 if errorlevel 1 (
     echo       git not found, installing via winget...
-    winget install --id Git.Git -e --source winget --custom "/o:PathOption=CmdTools" --accept-source-agreements --accept-package-agreements
+    call :InstallViaWinget --id Git.Git -e --source winget --custom "/o:PathOption=CmdTools"
+    if errorlevel 1 (
+        echo   [X] git install failed after retries.
+        goto :fail
+    )
     call :RefreshPath
 )
 where git >nul 2>&1
 if errorlevel 1 (
-    echo   [X] git install failed.
+    echo   [X] git still not found after install.
     goto :fail
 )
 echo   [OK] git ready
 
 REM ============ Step 3: clone / pull ============
 echo.
-echo [3/6] Fetch project
+echo [3/7] Fetch project
 
 if exist "%PROJECT_ROOT%" (
     if exist "%PROJECT_ROOT%\.git" (
@@ -115,15 +124,55 @@ if exist "%PROJECT_ROOT%" (
     echo   [OK] project downloaded
 )
 
-REM ---- Validate project ----
 if not exist "%PROJECT_ROOT%\pyproject.toml" (
     echo   [X] %PROJECT_ROOT% is not a valid project - pyproject.toml missing
     goto :fail
 )
 
-REM ============ Step 4: uv sync ============
+REM ============ Step 4: Cleanup legacy skillbridge_env ============
 echo.
-echo [4/6] Install MCP dependencies
+echo [4/7] Cleanup legacy skillbridge_env
+if exist "%LEGACY_ENV%" (
+    echo       Found legacy env: %LEGACY_ENV%
+    echo       Removing it (v4 uses a single .venv inside the project)...
+    rmdir /S /Q "%LEGACY_ENV%" 2>nul
+    if exist "%LEGACY_ENV%" (
+        echo   [!] Could not fully delete - Allegro may be running.
+        echo       Close Allegro, then re-run deploy.bat to clean it up.
+        echo       (Continuing anyway; the new env does not depend on it.)
+    ) else (
+        echo   [OK] legacy env removed
+    )
+) else (
+    echo   [OK] no legacy env found
+)
+
+REM ============ Step 5: uv sync (create/update project .venv) ============
+echo.
+echo [5/7] Install dependencies into project .venv
+
+REM If .venv exists with an incompatible Python version, delete it first.
+REM (uv sync will NOT auto-recreate a venv with the wrong version.)
+if exist "%VENV_PYTHON%" (
+    set "VENV_VER="
+    for /f "delims=" %%v in ('"%VENV_PYTHON%" -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2^>nul') do set "VENV_VER=%%v"
+    if defined VENV_VER (
+        echo       existing .venv Python: !VENV_VER!
+        set "RECREATE="
+        for /f "tokens=1,2 delims=." %%a in ("!VENV_VER!") do (
+            if %%a GTR 3 set "RECREATE=1"
+            if %%a EQU 3 if %%b GEQ 13 set "RECREATE=1"
+        )
+        if defined RECREATE (
+            echo   [!] Python !VENV_VER! is incompatible with skillbridge - recreating .venv
+            rmdir /S /Q "%PROJECT_ROOT%\.venv" 2>nul
+        )
+    ) else (
+        echo   [!] Could not detect .venv Python version - recreating to be safe
+        rmdir /S /Q "%PROJECT_ROOT%\.venv" 2>nul
+    )
+)
+
 pushd "%PROJECT_ROOT%"
 "!UV!" sync
 if errorlevel 1 (
@@ -132,27 +181,31 @@ if errorlevel 1 (
     goto :fail
 )
 popd
-echo   [OK] dependencies installed
 
-REM ============ Step 5: SkillBridge ============
+if not exist "%VENV_PYTHON%" (
+    echo   [X] %VENV_PYTHON% not found after uv sync
+    goto :fail
+)
+echo   [OK] dependencies installed into .venv
+
+REM ============ Step 6: Configure Allegro auto-load ============
 echo.
-echo [5/6] Configure Allegro SkillBridge auto-load
+echo [6/7] Configure Allegro SkillBridge auto-load
 if not exist "%PROJECT_ROOT%\Tools\install_skillbridge.py" (
     echo   [X] Tools\install_skillbridge.py not found.
     goto :fail
 )
-"!UV!" run "%PROJECT_ROOT%\Tools\install_skillbridge.py"
+"!UV!" run --directory "%PROJECT_ROOT%" python "%PROJECT_ROOT%\Tools\install_skillbridge.py"
 if errorlevel 1 (
     echo   [X] install_skillbridge.py failed.
     goto :fail
 )
-echo   [OK] SkillBridge configured
+echo   [OK] Allegro configured
 
-REM ============ Step 6: MCP config ============
+REM ============ Step 7: MCP config ============
 echo.
-echo [6/6] Generate MCP config
+echo [7/7] Generate MCP config
 
-REM JSON escape: backslash \ -> \\
 set "UV_ESC=!UV:\=\\!"
 set "ROOT_ESC=!PROJECT_ROOT:\=\\!"
 set "MCP_FILE=%SCRIPT_DIR%\mcp-config.json"
@@ -168,7 +221,6 @@ echo   }
 echo }
 ) > "!MCP_FILE!"
 
-REM ---- Locate SKILL.md ----
 set "SKILL_DIR="
 if exist "%PROJECT_ROOT%\.trae\skills\footprint-tolerance-check\SKILL.md" (
     set "SKILL_DIR=%PROJECT_ROOT%\.trae\skills\footprint-tolerance-check"
@@ -219,15 +271,58 @@ if not defined UV if exist "%LOCALAPPDATA%\Programs\uv\uv.exe" set "UV=%LOCALAPP
 exit /b 0
 
 :RefreshPath
-REM Non-destructive refresh: keep current session PATH, append common dirs.
-REM Never reset PATH from registry (REG_EXPAND_SZ has literal %VAR% strings
-REM that cmd does not expand on "set").
 set "PATH=%PATH%;%LOCALAPPDATA%\Microsoft\WindowsApps"
 set "PATH=%PATH%;%USERPROFILE%\.local\bin"
 set "PATH=%PATH%;%USERPROFILE%\.cargo\bin"
 set "PATH=%PATH%;%LOCALAPPDATA%\Programs\uv"
 set "PATH=%PATH%;C:\Program Files\Git\cmd"
 exit /b 0
+
+:CleanWingetLeftover
+tasklist /FI "IMAGENAME eq winget.exe" 2>nul | find /I "winget.exe" >nul
+if not errorlevel 1 (
+    echo   [!] Leftover winget process detected from a previous run.
+    echo       Cleaning it up...
+    taskkill /IM winget.exe /F >nul 2>&1
+    timeout /t 2 /nobreak >nul
+    echo   [OK] leftover cleaned.
+)
+exit /b 0
+
+:InstallViaWinget
+set "WG_LOG=%TEMP%\winget_install_%RANDOM%.log"
+set /a WG_TRY=0
+
+:WingetTryLoop
+set /a WG_TRY+=1
+echo       winget install - attempt !WG_TRY!/3...
+winget install %* --accept-source-agreements --accept-package-agreements --log-file "!WG_LOG!"
+if not errorlevel 1 (
+    echo   [OK] installed on attempt !WG_TRY!
+    exit /b 0
+)
+
+if !WG_TRY! GEQ 3 (
+    echo   [X] winget install failed after 3 attempts.
+    echo       Detailed log: !WG_LOG!
+    echo       Please open that file and share the last 30 lines.
+    exit /b 1
+)
+
+echo       attempt !WG_TRY! failed. Running repair sequence...
+echo       [repair 1/3] killing leftover winget processes...
+taskkill /IM winget.exe /F >nul 2>&1
+timeout /t 2 /nobreak >nul
+
+echo       [repair 2/3] updating winget sources...
+winget source update >nul 2>&1
+
+echo       [repair 3/3] resetting winget sources...
+winget source reset --force >nul 2>&1
+
+echo       waiting 5s before retry...
+timeout /t 5 /nobreak >nul
+goto :WingetTryLoop
 
 :fail
 echo.

@@ -1,29 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-install_skillbridge.py —— 一键配置 Allegro 自动加载 SkillBridge
+install_skillbridge.py —— 为 Allegro 配置 SkillBridge 自动加载
 
-核心功能：
-  1. 确保 uv 已安装
-  2. 在 ~/.local/share/skillbridge_env 建固定虚拟环境，装 skillbridge
-  3. 定位 pythonw.exe 和 python_server.il 的固定路径
-  4. 多策略搜索 Allegro 的 pcbenv 目录（环境变量 / 常见路径 / 盘符扫描 / 深度搜索）
-  5. 在 allegro.ilinit 里追加"标记块"，不覆盖已有内容
-  6. 支持 --uninstall 一键移除
+v3 变更（配合 v4 deploy.bat 的单环境方案）：
+  - 不再创建/管理任何 venv；环境由 deploy.bat 的 `uv sync` 建在 <项目>\.venv
+  - 只做两件事：
+      1. 定位 pcbenv 目录
+      2. 写 allegro.ilinit，指向 <项目>\.venv\Scripts\pythonw.exe
+  - 原来的 ENV_DIR_NAME / ensure_uv / ensure_skillbridge_env 全部删除
 
-用法：
-    uv run install_skillbridge.py                        # 默认搜索
-    uv run install_skillbridge.py --deep-search          # 全盘深搜
-    uv run install_skillbridge.py --pcbenv "C:/path"     # 手动指定
-    uv run install_skillbridge.py --uninstall            # 卸载
-    uv run install_skillbridge.py --dry-run              # 预览
+为什么找 pcbenv 的活放在 Python 里而不是 bat：
+  - 需要跨盘扫描、解析环境变量、多策略去重排序
+  - bat 写这些会极其脆弱、难以维护
+  - 这也让"一个入口 + 一个辅助脚本"成为最务实的方案
 
-注意：
-  allegro.ilinit 本身是 SKILL 文件，里面所有内容默认就是 SKILL 语句。
-  因此不要写单独的 `skill` 前缀命令，否则会报 "undefined variable - skill"。
-
-关于 pyKillServer：
-  pyStartServer 启动的 Python 进程是独立的，Allegro 关闭时不会自动结束它。
-  所以在每次启动前先调 pyKillServer，避免反复开关 Allegro 时累积多个进程。
+用法（一般由 deploy.bat 自动调用）：
+    uv run python Tools/install_skillbridge.py
+    uv run python Tools/install_skillbridge.py --pcbenv "C:/path/to/pcbenv"
+    uv run python Tools/install_skillbridge.py --uninstall
+    uv run python Tools/install_skillbridge.py --dry-run
 """
 from __future__ import annotations
 
@@ -33,17 +28,19 @@ import platform
 import re
 import shutil
 import string
-import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
+# ---- 项目根 = 本文件所在目录（Tools/）的上一级 ----
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+VENV_DIR = PROJECT_ROOT / ".venv"
+VENV_PYTHON = VENV_DIR / "Scripts" / "python.exe"
+VENV_PYTHONW = VENV_DIR / "Scripts" / "pythonw.exe"
+
 # ---- 标记，用于在 allegro.ilinit 里定位插入的段落 ----
 BEGIN_MARK = ";; ==== SkillBridge Auto-Load BEGIN (do not edit) ===="
 END_MARK   = ";; ==== SkillBridge Auto-Load END ===="
-
-# ---- 虚拟环境目录名 ----
-ENV_DIR_NAME = "skillbridge_env"
 
 # ---- 判断是否为 pcbenv 的标志文件 ----
 PCBENV_MARKER_FILES = ["allegro.ilinit", "allegro.ini", "env", "pcbenv.ini"]
@@ -63,129 +60,38 @@ def log(msg: str, level: str = "INFO") -> None:
     print(f"{prefix} {msg}")
 
 
-def which(cmd: str) -> str | None:
-    return shutil.which(cmd)
-
-
-def run(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        cmd, capture_output=True, text=True, encoding="utf-8",
-        errors="replace", **kwargs,
-    )
-
-
-def venv_python_path(env_dir: Path) -> Path:
-    if platform.system() == "Windows":
-        return env_dir / "Scripts" / "python.exe"
-    return env_dir / "bin" / "python"
-
-
-def venv_pythonw_path(env_dir: Path) -> Path:
-    if platform.system() == "Windows":
-        pw = env_dir / "Scripts" / "pythonw.exe"
-        if pw.is_file():
-            return pw
-    return venv_python_path(env_dir)
-
-
 # ============================================================
-# 步骤 1：确保 uv
+# 校验 .venv 是否就绪（由 deploy.bat 的 uv sync 创建）
 # ============================================================
-def ensure_uv() -> str:
-    uv = which("uv")
-    if uv:
-        log(f"uv 已找到: {uv}", "OK")
-        return uv
+def check_venv() -> tuple[Path, Path] | None:
+    """
+    检查 <项目>\.venv 是否已就绪，返回 (pythonw_path, il_path) 或 None。
 
-    log("找不到 uv 命令", "ERR")
-    print()
-    print("请先安装 uv，任选一种方式：")
-    print("  Windows:  winget install astral-sh.uv")
-    print("  Windows:  powershell -ExecutionPolicy ByPass -c \"irm https://astral.sh/uv/install.ps1 | iex\"")
-    print("  macOS:    brew install uv")
-    print("  Linux:    curl -LsSf https://astral.sh/uv/install.sh | sh")
-    print()
-    sys.exit(1)
+    il_path 是 skillbridge 的 SKILL 加载入口
+    （.venv\Lib\site-packages\skillbridge\server\python_server.il）。
+    """
+    if not VENV_PYTHON.is_file():
+        log(f"未找到 .venv 的 Python: {VENV_PYTHON}", "ERR")
+        log("请先运行 deploy.bat（它会执行 uv sync 建好 .venv）", "INFO")
+        return None
 
+    # pythonw 用于无窗口启动，若不存在则退化用 python.exe
+    pythonw = VENV_PYTHONW if VENV_PYTHONW.is_file() else VENV_PYTHON
 
-# ============================================================
-# 步骤 2：skillbridge 虚拟环境
-# ============================================================
-def ensure_skillbridge_env(uv: str, dry_run: bool) -> Path:
-    env_dir = Path.home() / ".local" / "share" / ENV_DIR_NAME
-    python_exe = venv_python_path(env_dir)
-
-    if python_exe.is_file():
-        r = run([str(python_exe), "-c", "import skillbridge"])
-        if r.returncode == 0:
-            log(f"已存在: {env_dir}", "OK")
-            return env_dir
-
-        log("环境存在但缺 skillbridge，补装", "INFO")
-        if dry_run:
-            log(f"[DRY-RUN] 将执行: {uv} pip install --python {python_exe} skillbridge", "WARN")
-            return env_dir
-        r = run([uv, "pip", "install", "--python", str(python_exe), "skillbridge"])
-        if r.returncode != 0:
-            log("补装 skillbridge 失败", "ERR")
-            print(r.stdout)
-            print(r.stderr)
-            sys.exit(1)
-        log(f"补装完成: {env_dir}", "OK")
-        return env_dir
-
-    log(f"未安装，将创建虚拟环境: {env_dir}")
-    if dry_run:
-        log(f"[DRY-RUN] 将执行: {uv} venv {env_dir}", "WARN")
-        log(f"[DRY-RUN] 将执行: {uv} pip install --python {python_exe} skillbridge", "WARN")
-        return env_dir
-
-    env_dir.parent.mkdir(parents=True, exist_ok=True)
-    log(f"执行: {uv} venv {env_dir}")
-    r = run([uv, "venv", str(env_dir)])
-    if r.returncode != 0:
-        log("创建虚拟环境失败", "ERR")
-        print(r.stdout)
-        print(r.stderr)
-        sys.exit(1)
-
-    log("执行: uv pip install skillbridge")
-    r = run([uv, "pip", "install", "--python", str(python_exe), "skillbridge"])
-    if r.returncode != 0:
-        log("安装 skillbridge 失败", "ERR")
-        print(r.stdout)
-        print(r.stderr)
-        sys.exit(1)
-
-    log(f"安装完成: {env_dir}", "OK")
-    return env_dir
-
-
-# ============================================================
-# 步骤 3：从虚拟环境拿固定路径
-# ============================================================
-def find_python_exe(env_dir: Path) -> Path:
-    for c in [
-        env_dir / "Scripts" / "python.exe",
-        env_dir / "bin" / "python",
-        env_dir / "bin" / "python3",
-    ]:
-        if c.is_file():
-            return c
-    raise FileNotFoundError(f"在 {env_dir} 下找不到 python 可执行文件")
-
-
-def find_python_server_il(env_dir: Path) -> Path:
-    hits = list(env_dir.glob("**/skillbridge/server/python_server.il"))
+    hits = list(VENV_DIR.glob("**/skillbridge/server/python_server.il"))
     if not hits:
-        raise FileNotFoundError(
-            f"在 {env_dir} 下找不到 skillbridge/server/python_server.il"
-        )
-    return hits[0]
+        log(f"在 {VENV_DIR} 下找不到 skillbridge/server/python_server.il", "ERR")
+        log("可能 uv sync 未完成，请重新运行 deploy.bat", "INFO")
+        return None
+    il_path = hits[0]
+
+    log(f"Pythonw: {pythonw}", "OK")
+    log(f"SKILL:   {il_path}", "OK")
+    return pythonw, il_path
 
 
 # ============================================================
-# 步骤 4：多策略搜索 pcbenv
+# 多策略搜索 pcbenv（逻辑与原版一致，保留不动）
 # ============================================================
 def _search_dir_recursive(root: Path, max_depth: int, results: list[Path],
                           visited: set[str]) -> None:
@@ -351,18 +257,13 @@ def choose_pcbenv(candidates: list[Path], dry_run: bool) -> Path:
         print("  1. Allegro 从未启动过（首次启动才会创建 pcbenv）")
         print("  2. Allegro 装在非常规路径")
         print()
-        print("建议按以下顺序尝试：")
-        print()
-        print("  [A] 启动一次 Allegro PCB Editor，然后重新运行本脚本")
-        print()
-        print("  [B] 全盘深度搜索（可能耗时几分钟）：")
-        print("      uv run install_skillbridge.py --deep-search")
-        print()
-        print("  [C] 手动指定路径：")
-        print("      uv run install_skillbridge.py --pcbenv \"C:/完整/路径/pcbenv\"")
+        print("建议：")
+        print("  [A] 启动一次 Allegro PCB Editor，然后重新运行 deploy.bat")
+        print("  [B] 手动指定：")
+        print("      uv run python Tools/install_skillbridge.py --pcbenv \"C:/完整/路径/pcbenv\"")
         print()
         print("如何找到 pcbenv 路径？")
-        print("  打开 Allegro，在命令窗口输入：getShellEnvVar(\"SPB_Data\")")
+        print("  打开 Allegro，命令窗口输入：getShellEnvVar(\"SPB_Data\")")
         print("  返回值后面拼上 /pcbenv 就是它")
         print()
         sys.exit(1)
@@ -391,20 +292,14 @@ def choose_pcbenv(candidates: list[Path], dry_run: bool) -> Path:
 
 
 # ============================================================
-# 步骤 5：写 allegro.ilinit
+# 写 allegro.ilinit
 # ============================================================
-def build_marked_block(python_exe: Path, il_path: Path) -> str:
+def build_marked_block(pythonw: Path, il_path: Path) -> str:
     """
     生成要插入的 SKILL 段落。
 
-    重要 1：allegro.ilinit 本身就是 SKILL 文件，不要写单独的 `skill` 前缀，
-            否则会报 "undefined variable - skill"。
-
-    重要 2：每次启动前先调 pyKillServer，避免反复开关 Allegro 时累积多个
-            Python 进程。pyKillServer 在 python_server.il 加载后才可用。
+    注意：allegro.ilinit 本身是 SKILL 文件，不要写单独的 `skill` 前缀。
     """
-    env_dir = python_exe.parent.parent
-    pythonw = venv_pythonw_path(env_dir)
     py = str(pythonw).replace("\\", "/")
     il = str(il_path).replace("\\", "/")
     now = datetime.now().isoformat(timespec="seconds")
@@ -413,7 +308,7 @@ def build_marked_block(python_exe: Path, il_path: Path) -> str:
 ;; 生成时间: {now}
 ;; Python:   {py}
 ;; SKILL:    {il}
-;; 卸载: uv run install_skillbridge.py --uninstall
+;; 卸载: uv run python Tools/install_skillbridge.py --uninstall
 load("{il}")
 pyKillServer
 pyStartServer ?id "7777" ?python "{py}"
@@ -430,9 +325,9 @@ def remove_marked_block(text: str) -> tuple[str, bool]:
     return pattern.sub("", text), True
 
 
-def write_ilinit(pcbenv: Path, python_exe: Path, il_path: Path, dry_run: bool) -> Path:
+def write_ilinit(pcbenv: Path, pythonw: Path, il_path: Path, dry_run: bool) -> Path:
     target = pcbenv / "allegro.ilinit"
-    block = build_marked_block(python_exe, il_path)
+    block = build_marked_block(pythonw, il_path)
 
     if target.is_file():
         old = target.read_text(encoding="utf-8")
@@ -492,7 +387,6 @@ def uninstall() -> int:
     if found_any:
         print("提示：")
         print("  - Allegro 下次启动将不再自动加载 SkillBridge")
-        print(f"  - 如需彻底清理虚拟环境: 删除 {Path.home() / '.local' / 'share' / ENV_DIR_NAME}")
     return 0
 
 
@@ -501,7 +395,7 @@ def uninstall() -> int:
 # ============================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="为 Allegro 一键配置 SkillBridge 自动加载"
+        description="为 Allegro 配置 SkillBridge 自动加载（依赖 <项目>/.venv）"
     )
     parser.add_argument("--uninstall", action="store_true",
                         help="从 allegro.ilinit 里移除 SkillBridge 标记块")
@@ -521,32 +415,16 @@ def main():
     if args.uninstall:
         return uninstall()
 
-    # ---- 步骤 1：uv ----
-    log("步骤 1/5：检查 uv")
-    uv = ensure_uv()
-    print()
-
-    # ---- 步骤 2：skillbridge 环境 ----
-    log("步骤 2/5：检查/安装 skillbridge 虚拟环境")
-    env_dir = ensure_skillbridge_env(uv, args.dry_run)
-    print()
-
-    # ---- 步骤 3：拿路径 ----
-    log("步骤 3/5：从虚拟环境定位 Python 和 python_server.il")
-    try:
-        python_exe = find_python_exe(env_dir)
-        il_path = find_python_server_il(env_dir)
-    except FileNotFoundError as e:
-        log(str(e), "ERR")
+    # ---- 步骤 1：校验 .venv（由 deploy.bat 的 uv sync 建好） ----
+    log("步骤 1/3：校验 .venv")
+    checked = check_venv()
+    if checked is None:
         return 1
-    pythonw = venv_pythonw_path(env_dir)
-    log(f"Python:  {python_exe}", "OK")
-    log(f"Pythonw: {pythonw}", "OK")
-    log(f"SKILL:   {il_path}", "OK")
+    pythonw, il_path = checked
     print()
 
-    # ---- 步骤 4：找 pcbenv ----
-    log("步骤 4/5：查找 Allegro 的 pcbenv 目录")
+    # ---- 步骤 2：找 pcbenv ----
+    log("步骤 2/3：查找 Allegro 的 pcbenv 目录")
     if args.pcbenv:
         pcbenv = Path(args.pcbenv)
         if not pcbenv.is_dir():
@@ -558,9 +436,9 @@ def main():
         pcbenv = choose_pcbenv(candidates, args.dry_run)
     print()
 
-    # ---- 步骤 5：写 allegro.ilinit ----
-    log("步骤 5/5：更新 allegro.ilinit")
-    target = write_ilinit(pcbenv, python_exe, il_path, args.dry_run)
+    # ---- 步骤 3：写 allegro.ilinit ----
+    log("步骤 3/3：更新 allegro.ilinit")
+    target = write_ilinit(pcbenv, pythonw, il_path, args.dry_run)
     print()
 
     if not args.dry_run:
@@ -576,7 +454,7 @@ def main():
         print()
         print("如果出问题：")
         print(f"  - 备份文件目录: {target.parent}")
-        print("  - 一键卸载: uv run install_skillbridge.py --uninstall")
+        print("  - 一键卸载: uv run python Tools/install_skillbridge.py --uninstall")
     return 0
 
 

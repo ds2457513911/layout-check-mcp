@@ -400,11 +400,14 @@ def check_pad_size(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List
         )]
 
     # ---------- 2.1 焊盘尺寸与命名一致性 ----------
-    # 收集第一个有效样本，用于报告显示
+    # 注意：extracta 数据源给的是 padstack 原始定义（未旋转），
+    #       SkillBridge 给的是 pin 实例旋转后的实际尺寸。
+    #       pin 旋转 90°/270° 时，宽高顺序会互换，两者都算正确。
+    #       所以判定时允许宽高互换。
     all_match = True
     mismatch_detail = []
-    sample_named = None      # "1.4×1.2"
-    sample_actual = None     # "1.4×1.2"
+    sample_named = None
+    sample_actual = None
     sample_pin = None
 
     for pin in pins:
@@ -422,19 +425,26 @@ def check_pad_size(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List
             continue
         w_actual, h_actual = etch["size"]
 
-        # 记录第一个样本（用于报告显示）
         if sample_named is None:
             sample_named = _fmt_dim(w_named, h_named)
             sample_actual = _fmt_dim(w_actual, h_actual)
             sample_pin = pin.get("number")
 
-        if abs(w_actual - w_named) > tol or abs(h_actual - h_named) > tol:
+        # 允许宽高互换（应对 pin 旋转 90°/270° 的场景）
+        match_normal = (
+            abs(w_actual - w_named) <= tol and
+            abs(h_actual - h_named) <= tol
+        )
+        match_swapped = (
+            abs(w_actual - h_named) <= tol and
+            abs(h_actual - w_named) <= tol
+        )
+        if not (match_normal or match_swapped):
             all_match = False
             mismatch_detail.append(
                 f"pin{pin['number']}: 命名 {w_named}×{h_named}, 实际 {_round(w_actual)}×{_round(h_actual)}"
             )
 
-    # value 用 dict，含命名值和实测值（供报告显示）
     v21 = {
         "sample_pin": sample_pin,
         "padstack": sample_named,
@@ -445,7 +455,7 @@ def check_pad_size(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List
         "2.1", "焊盘尺寸与命名一致性",
         "PASS" if all_match else "FAIL",
         value=v21 if v21 else f"容差 ±{tol}mm",
-        rule="焊盘实际尺寸必须与 padstack 命名匹配",
+        rule="焊盘实际尺寸必须与 padstack 命名匹配（允许宽高互换）",
         detail=" | ".join(mismatch_detail[:3]),
         expected=f"= padstack 命名值 ±{tol}",
         source="self",
@@ -532,7 +542,7 @@ def check_pad_size(data: Dict, theoretical: Optional[Dict], rules: Dict) -> List
         ))
 
     return items
-
+    
 
 # ============================================================
 # 三、间距与原点

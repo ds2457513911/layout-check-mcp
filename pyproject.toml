@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "layout-check-mcp"
 version = "1.0.0"
 description = "PCB footprint tolerance check MCP server"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.13"
 license = "MIT"
 authors = [
     {name = "ds2457513911", email = "ds2457513911@163.com"},

@@ -1,0 +1,43 @@
+# ============================================================
+# extracta 视图定义：一个 .dra → pins + pads + geometry
+# ============================================================
+# 三个视图对应三个输出文件，命令行按顺序对应：
+#   extracta <dra> footprint_views.txt pins.txt pads.txt geom.txt
+#
+# 重要：PAD_DEF 视图不接受字段声明（见 pad_rep.txt 的注释），
+#       只写视图名 + END，它会自动输出固定列（PAD_NAME / REC_NUMBER /
+#       LAYER / ... / APADSHAPENAME）
+# ============================================================
+
+# ---- 视图 1：引脚坐标 ----
+COMPOSITE_PAD
+PIN_NUMBER
+SYM_NAME
+PAD_STACK_NAME
+PIN_X
+PIN_Y
+END
+
+# ---- 视图 2：焊盘逐层定义（字段名不写！PAD_DEF 自动输出全部列） ----
+PAD_DEF
+END
+
+# ---- 视图 3：PACKAGE GEOMETRY 全层图形元素 ----
+FULL_GEOMETRY
+CLASS = "PACKAGE GEOMETRY"
+CLASS
+SUBCLASS
+RECORD_TAG
+GRAPHIC_DATA_NAME
+GRAPHIC_DATA_NUMBER
+GRAPHIC_DATA_1
+GRAPHIC_DATA_2
+GRAPHIC_DATA_3
+GRAPHIC_DATA_4
+GRAPHIC_DATA_5
+GRAPHIC_DATA_6
+GRAPHIC_DATA_7
+GRAPHIC_DATA_8
+GRAPHIC_DATA_9
+GRAPHIC_DATA_10
+END
