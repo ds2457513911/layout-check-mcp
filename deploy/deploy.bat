@@ -6,13 +6,15 @@ title layout-check-mcp deploy
 REM ============================================================
 REM  deploy.bat -- layout-check-mcp standalone deployer  (v4)
 REM
-REM  v4 变更（合并双环境为单环境）：
-REM    - 只在 <项目>\.venv 建一个环境，里面同时装 MCP 依赖和 skillbridge
-REM    - 不再创建 ~/.local/share/skillbridge_env
-REM    - deploy 时自动清理旧的 skillbridge_env
-REM    - allegro.ilinit 的 pythonw 路径改为指向 .venv\Scripts\pythonw.exe
+REM  v4 change: single environment
+REM    - Only one .venv inside the project directory
+REM    - No ~/.local/share/skillbridge_env anymore
+REM    - deploy auto-removes the legacy skillbridge_env if present
+REM    - allegro.ilinit points to <project>\.venv\Scripts\pythonw.exe
 REM
-REM  Save requirement: ASCII or UTF-8 (no BOM), English-only prompts.
+REM  Save requirement: pure ASCII or UTF-8 (no BOM). English only.
+REM  NOTE: never put ( or ) inside "echo" lines that live inside an
+REM        "if (...)" block. CMD parses them as block delimiters.
 REM ============================================================
 
 REM ---- Script directory (strip trailing backslash) ----
@@ -134,12 +136,12 @@ echo.
 echo [4/7] Cleanup legacy skillbridge_env
 if exist "%LEGACY_ENV%" (
     echo       Found legacy env: %LEGACY_ENV%
-    echo       Removing it (v4 uses a single .venv inside the project)...
+    echo       Removing it. v4 uses a single .venv inside the project.
     rmdir /S /Q "%LEGACY_ENV%" 2>nul
     if exist "%LEGACY_ENV%" (
         echo   [!] Could not fully delete - Allegro may be running.
         echo       Close Allegro, then re-run deploy.bat to clean it up.
-        echo       (Continuing anyway; the new env does not depend on it.)
+        echo       Continuing anyway; the new env does not depend on it.
     ) else (
         echo   [OK] legacy env removed
     )
@@ -147,15 +149,13 @@ if exist "%LEGACY_ENV%" (
     echo   [OK] no legacy env found
 )
 
-REM ============ Step 5: uv sync (create/update project .venv) ============
+REM ============ Step 5: uv sync ============
 echo.
 echo [5/7] Install dependencies into project .venv
 
-REM If .venv exists with an incompatible Python version, delete it first.
-REM (uv sync will NOT auto-recreate a venv with the wrong version.)
 if exist "%VENV_PYTHON%" (
     set "VENV_VER="
-    for /f "delims=" %%v in ('"%VENV_PYTHON%" -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2^>nul') do set "VENV_VER=%%v"
+    for /f "delims=" %%v in ('"%VENV_PYTHON%" -c "import sys; print(str(sys.version_info[0]) + '.' + str(sys.version_info[1]))" 2^>nul') do set "VENV_VER=%%v"
     if defined VENV_VER (
         echo       existing .venv Python: !VENV_VER!
         set "RECREATE="
