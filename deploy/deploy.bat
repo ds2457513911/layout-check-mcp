@@ -296,7 +296,7 @@ set /a WG_TRY=0
 :WingetTryLoop
 set /a WG_TRY+=1
 echo       winget install - attempt !WG_TRY!/3...
-winget install %* --accept-source-agreements --accept-package-agreements --log-file "!WG_LOG!"
+winget install %* --accept-source-agreements --accept-package-agreements --log "!WG_LOG!"
 if not errorlevel 1 (
     echo   [OK] installed on attempt !WG_TRY!
     exit /b 0
