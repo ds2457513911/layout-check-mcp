@@ -8,7 +8,7 @@ mcp_server/server.py —— MCP 服务入口
 客户端配置示例（Claude Desktop / Cursor）：
     {
       "mcpServers": {
-        "layout-check-v2": {
+        "layout-check-mcp-v2": {
           "command": "python",
           "args": ["-m", "mcp_server.server"],
           "cwd": "C:\\\\path\\\\to\\\\project"

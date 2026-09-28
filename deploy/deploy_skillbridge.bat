@@ -4,26 +4,24 @@ setlocal EnableDelayedExpansion
 title layout-check-mcp deploy
 
 REM ============================================================
-REM  deploy.bat -- layout-check-mcp standalone deployer  (v6)
-REM
-REM  v6 change:
-REM    - Step 6 (Allegro SkillBridge auto-load) is now OPTIONAL.
-REM      SkillBridge is a fallback data source. The primary path is
-REM      extracta.exe, which does not need SkillBridge or Allegro running.
-REM      If pcbenv cannot be found (e.g. Allegro never launched on this
-REM      machine), we print a warning and CONTINUE instead of aborting.
+REM  deploy.bat -- layout-check-mcp standalone deployer  (v5)
 REM
 REM  v5 change (fix winget false-success bug):
 REM    - InstallViaWinget now takes a verify command as its first arg
 REM      and runs it for real after each attempt. winget's exit code is
 REM      NOT trusted: the underlying installer can fail (exit 1) while
-REM      winget still returns 0.
-REM    - Git install: dropped "--custom /o:PathOption=CmdTools", added
-REM      "--scope user".
-REM    - winget log flag: --log-file -> --log.
+REM      winget still returns 0. Same lesson as extracta.exe -- do not
+REM      trust the exit code, verify the artifact.
+REM    - Git install: dropped "--custom /o:PathOption=CmdTools" (it
+REM      caused the installer to fail with exit 1), added "--scope user"
+REM      (avoids requiring admin rights).
+REM    - winget log flag fixed: --log-file does not exist, use --log.
 REM
 REM  Save requirement: pure ASCII or UTF-8 (no BOM). English only.
-REM  Line endings MUST be CRLF.
+REM  Editor requirement: line endings MUST be CRLF. LF-only breaks
+REM                      CMD's "call :label" resolution.
+REM  NOTE: never put ( or ) inside "echo" lines that live inside an
+REM        "if (...)" block. CMD parses them as block delimiters.
 REM ============================================================
 
 REM ---- Script directory (strip trailing backslash) ----
@@ -195,28 +193,19 @@ if not exist "%VENV_PYTHON%" (
 )
 echo   [OK] dependencies installed into .venv
 
-REM ============ Step 6: Configure Allegro auto-load (OPTIONAL) ============
+REM ============ Step 6: Configure Allegro auto-load ============
 echo.
-echo [6/7] Configure Allegro SkillBridge auto-load (optional)
-echo       Note: SkillBridge is a FALLBACK data source. The primary
-echo       source is extracta.exe and does NOT need it configured.
-
+echo [6/7] Configure Allegro SkillBridge auto-load
 if not exist "%PROJECT_ROOT%\Tools\install_skillbridge.py" (
-    echo   [!] Tools\install_skillbridge.py not found - skipping.
-    goto :step6_done
+    echo   [X] Tools\install_skillbridge.py not found.
+    goto :fail
 )
-
 "!UV!" run --directory "%PROJECT_ROOT%" python "%PROJECT_ROOT%\Tools\install_skillbridge.py"
 if errorlevel 1 (
-    echo   [!] SkillBridge auto-load not configured -- this is OK.
-    echo       extracta is your primary data source and does not need it.
-    echo       To configure SkillBridge manually later, run:
-    echo         uv run python Tools\install_skillbridge.py --pcbenv "path\to\pcbenv"
-) else (
-    echo   [OK] Allegro configured
+    echo   [X] install_skillbridge.py failed.
+    goto :fail
 )
-
-:step6_done
+echo   [OK] Allegro configured
 
 REM ============ Step 7: MCP config ============
 echo.
@@ -261,12 +250,8 @@ if defined SKILL_DIR (
     echo     [SKILL.md not found - check project structure]
 )
 echo.
-echo [3] Data source
-echo     Primary: extracta.exe (auto-detected from Cadence install)
-echo     Fallback: SkillBridge (optional, not configured)
-echo.
-echo [4] Next steps
-echo     1. Restart Allegro PCB Editor (only needed if using SkillBridge)
+echo [3] Next steps
+echo     1. Restart Allegro PCB Editor
 echo     2. Verify port: netstat -ano ^| findstr 7777
 echo     3. Restart your Agent app, confirm MCP is connected
 echo.
@@ -291,6 +276,12 @@ if not defined UV if exist "%LOCALAPPDATA%\Programs\uv\uv.exe" set "UV=%LOCALAPP
 exit /b 0
 
 :RefreshPath
+REM Append, never reset. Reset loses the original Windows PATH.
+REM Include every path where winget may drop a binary:
+REM   - WindowsApps : alias shims
+REM   - WinGet\Links: portable package aliases (uv lands here)
+REM   - .local\bin / .cargo\bin : astral installer locations
+REM   - Programs\uv / Programs\Git / Program Files\Git : winget scope-user/machine
 set "PATH=%PATH%;%LOCALAPPDATA%\Microsoft\WinGet\Links"
 set "PATH=%PATH%;%LOCALAPPDATA%\Microsoft\WindowsApps"
 set "PATH=%PATH%;%USERPROFILE%\.local\bin"
@@ -315,12 +306,15 @@ exit /b 0
 :InstallViaWinget
 REM ---- Usage ----
 REM   call :InstallViaWinget "<verify_cmd>" <winget_args...>
+REM Examples:
+REM   call :InstallViaWinget "where uv" astral-sh.uv
+REM   call :InstallViaWinget "where git" --id Git.Git -e --source winget --scope user
 REM
 REM Why verify_cmd:
 REM   winget returns 0 even when the underlying installer fails (exit 1).
 REM   So we do not trust winget's exit code. We run verify_cmd after each
-REM   attempt and only consider it successful if the binary is actually
-REM   resolvable on PATH.
+REM   attempt and only consider the install successful if the binary is
+REM   actually resolvable on PATH. Same principle as extracta.exe.
 set "VERIFY_CMD=%~1"
 set "WG_ARGS="
 shift
@@ -339,6 +333,7 @@ set /a WG_TRY+=1
 echo       winget install - attempt !WG_TRY!/3...
 winget install !WG_ARGS! --accept-source-agreements --accept-package-agreements --log "!WG_LOG!"
 
+REM Refresh PATH, then actually run the verify command.
 call :RefreshPath
 %VERIFY_CMD% >nul 2>&1
 if not errorlevel 1 (

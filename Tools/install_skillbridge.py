@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 install_skillbridge.py —— 为 Allegro 配置 SkillBridge 自动加载
 
 v3 变更（配合 v4 deploy.bat 的单环境方案）：
@@ -64,7 +64,7 @@ def log(msg: str, level: str = "INFO") -> None:
 # 校验 .venv 是否就绪（由 deploy.bat 的 uv sync 创建）
 # ============================================================
 def check_venv() -> tuple[Path, Path] | None:
-    """
+    r"""
     检查 <项目>\.venv 是否已就绪，返回 (pythonw_path, il_path) 或 None。
 
     il_path 是 skillbridge 的 SKILL 加载入口
