@@ -17,6 +17,7 @@ venv/
 marker_out/
 *.log
 *.log,*
+.trash/
 mcp_timing.log
 mcp-config.json
 extract.log*
